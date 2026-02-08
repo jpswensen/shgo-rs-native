@@ -39,6 +39,7 @@ use std::time::{Duration, Instant};
 
 use indexmap::IndexMap;
 use parking_lot::RwLock;
+use rayon::prelude::*;
 
 use crate::complex::Complex;
 use crate::coordinates::Coordinates;
@@ -689,13 +690,14 @@ where
                 );
             }
 
-            // Process minimizers with local optimization using topograph ordering
-            // (matching Python's minimise_pool + g_topograph strategy)
+            // Process minimizers with local optimization in parallel
+            // Pre-compute all LCBs from the (read-only) complex, then dispatch
+            // all local minimizations concurrently via rayon.
             if self.options.minimize_every_iter {
                 let maxiter_local = self.options.maxiter_local.unwrap_or(usize::MAX);
 
                 // Collect candidates: feasible, not already in LMC
-                let mut candidates: Vec<_> = minimizers
+                let candidates: Vec<_> = minimizers
                     .iter()
                     .filter(|v| v.feasible() != Some(false))
                     .filter(|v| {
@@ -703,82 +705,37 @@ where
                             v.coordinates().as_slice().to_vec(),
                         ))
                     })
+                    .take(maxiter_local)
                     .collect();
 
-                // sort_min_pool: sort by function value (ascending)
-                candidates.sort_by(|a, b| {
-                    let fa = a.f().unwrap_or(f64::INFINITY);
-                    let fb = b.f().unwrap_or(f64::INFINITY);
-                    fa.partial_cmp(&fb).unwrap_or(std::cmp::Ordering::Equal)
-                });
-
                 if !candidates.is_empty() {
-                    let mut local_count = 0;
+                    // Pre-compute starting points and locally convex bounds
+                    // (reads from Complex which is not modified during minimization)
+                    let work_items: Vec<(Vec<f64>, Vec<(f64, f64)>)> = candidates
+                        .iter()
+                        .map(|v| {
+                            let x0 = v.coordinates().as_slice().to_vec();
+                            let lcb = self.construct_lcb_simplicial(v, &complex);
+                            (x0, lcb)
+                        })
+                        .collect();
 
-                    // Step 1: Always minimize the best candidate first
-                    let best = candidates.remove(0);
-                    let x0: Vec<f64> = best.coordinates().as_slice().to_vec();
-                    let lcb = self.construct_lcb_simplicial(best, &complex);
-                    let mut last_x = x0.clone();
+                    // Run all local minimizations in parallel
+                    let local_results: Vec<Option<LocalMinimum>> = work_items
+                        .par_iter()
+                        .map(|(x0, lcb)| {
+                            self.minimize_local_from_point(x0, &lmap_cache, lcb)
+                        })
+                        .collect();
 
-                    if let Some(local_min) =
-                        self.minimize_local_from_point(&x0, &lmap_cache, &lcb)
-                    {
+                    // Gather successful results (order-independent: results are
+                    // deterministic per starting point via lmap_cache dedup)
+                    for local_min in local_results.into_iter().flatten() {
                         if local_min.success {
-                            last_x = local_min.x.clone();
+                            result.nlfev += local_min.nfev;
                             result.xl.push(local_min.x);
                             result.funl.push(local_min.fun);
-                            result.nlfev += local_min.nfev;
                         }
-                    }
-                    local_count += 1;
-
-                    // Step 2: Process remaining using g_topograph ordering
-                    // (pick candidate farthest from last solution each time)
-                    while !candidates.is_empty() && local_count < maxiter_local {
-                        // g_topograph: find candidate with greatest Euclidean
-                        // distance from the most recent local minimum
-                        let farthest_idx = candidates
-                            .iter()
-                            .enumerate()
-                            .max_by(|(_, a), (_, b)| {
-                                let da: f64 = a
-                                    .coordinates()
-                                    .as_slice()
-                                    .iter()
-                                    .zip(last_x.iter())
-                                    .map(|(ai, li)| (ai - li).powi(2))
-                                    .sum();
-                                let db: f64 = b
-                                    .coordinates()
-                                    .as_slice()
-                                    .iter()
-                                    .zip(last_x.iter())
-                                    .map(|(bi, li)| (bi - li).powi(2))
-                                    .sum();
-                                da.partial_cmp(&db)
-                                    .unwrap_or(std::cmp::Ordering::Equal)
-                            })
-                            .map(|(idx, _)| idx)
-                            .unwrap();
-
-                        let candidate = candidates.remove(farthest_idx);
-                        let x0: Vec<f64> =
-                            candidate.coordinates().as_slice().to_vec();
-                        let lcb =
-                            self.construct_lcb_simplicial(candidate, &complex);
-
-                        if let Some(local_min) =
-                            self.minimize_local_from_point(&x0, &lmap_cache, &lcb)
-                        {
-                            if local_min.success {
-                                last_x = local_min.x.clone();
-                                result.xl.push(local_min.x);
-                                result.funl.push(local_min.fun);
-                                result.nlfev += local_min.nfev;
-                            }
-                        }
-                        local_count += 1;
                     }
                 }
             } else {
@@ -1082,17 +1039,22 @@ where
                     .take(maxiter_local)
                     .collect();
 
-                // Local minimization with GLOBAL bounds
+                // Local minimization with GLOBAL bounds in parallel
                 // (matching Python's construct_lcb_delaunay which returns global bounds
                 //  without tightening, unlike simplicial mode's LCB)
-                for vertex in &candidates {
-                    let x0 = vertex.coordinates().as_slice().to_vec();
-                    if let Some(local_min) = self.minimize_local_from_point(&x0, &lmap_cache, &self.bounds) {
-                        if local_min.success {
-                            result.xl.push(local_min.x);
-                            result.funl.push(local_min.fun);
-                            result.nlfev += local_min.nfev;
-                        }
+                let local_results: Vec<Option<LocalMinimum>> = candidates
+                    .par_iter()
+                    .map(|vertex| {
+                        let x0 = vertex.coordinates().as_slice().to_vec();
+                        self.minimize_local_from_point(&x0, &lmap_cache, &self.bounds)
+                    })
+                    .collect();
+
+                for local_min in local_results.into_iter().flatten() {
+                    if local_min.success {
+                        result.xl.push(local_min.x);
+                        result.funl.push(local_min.fun);
+                        result.nlfev += local_min.nfev;
                     }
                 }
             } else {
