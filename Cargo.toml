@@ -1,0 +1,62 @@
+[package]
+name = "shgo-rs"
+version = "0.1.0"
+edition = "2021"
+authors = ["SHGO Rust Team"]
+description = "A high-performance Rust implementation of the SHGO (Simplicial Homology Global Optimization) algorithm"
+license = "MIT"
+keywords = ["optimization", "global-optimization", "numerical", "mathematics"]
+categories = ["mathematics", "science", "algorithms"]
+
+[lib]
+name = "shgo"
+crate-type = ["rlib", "cdylib", "staticlib"]
+
+[dependencies]
+# Core numerics
+ndarray = "0.17.2"
+
+# Parallel processing
+rayon = "1.10"
+parking_lot = "0.12"  # Faster RwLock implementation
+
+# Hashing
+ahash = "0.8"  # Fast hashing
+indexmap = "2.7"  # Ordered hash map (like Python's OrderedDict)
+
+# Utilities
+thiserror = "2.0"  # Error handling
+log = "0.4"  # Logging
+ordered-float = "5.1.0"  # Orderable floats for sorting
+
+# Local optimization
+nlopt = "0.8"  # NLopt library for local optimization
+
+# Computational geometry
+qhull = "0.4"  # QHull bindings for Delaunay triangulation (Sobol mode)
+
+# Quasi-random sequences
+sobol-qmc = "2.5"  # Joe-Kuo Sobol sequences (matching scipy's direction numbers)
+
+# C FFI
+libc = "0.2"
+
+[dev-dependencies]
+criterion = "0.8.2"  # Benchmarking
+approx = "0.5"  # Floating-point comparisons
+rand = "0.9.2"  # Random number generation for tests
+serde = { version = "1.0", features = ["derive"] }  # For test data serialization
+serde_json = "1.0"  # JSON for cross-validation with Python
+
+[[bench]]
+name = "benchmarks"
+harness = false
+
+[features]
+default = []
+parallel = []  # Enable parallel processing features
+
+[profile.release]
+lto = "fat"
+codegen-units = 1
+opt-level = 3
