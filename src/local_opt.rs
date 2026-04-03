@@ -155,6 +155,9 @@ pub struct LocalOptimizerOptions {
 
     /// Constraint tolerance (for algorithms that support constraints).
     pub constraint_tol: f64,
+
+    /// Verbosity: if true, print cost at each function evaluation during local optimization.
+    pub disp: bool,
 }
 
 impl Default for LocalOptimizerOptions {
@@ -169,6 +172,7 @@ impl Default for LocalOptimizerOptions {
             maxtime: None,
             initial_step: None,
             constraint_tol: 1e-8,
+            disp: false,
         }
     }
 }
@@ -260,12 +264,19 @@ where
     // Track function evaluations using interior mutability
     let fev_count = Rc::new(Cell::new(0usize));
     let fev_counter = Rc::clone(&fev_count);
+    let disp = options.disp;
+    let algo = options.algorithm;
 
     // Create the objective function wrapper for NLOPT
     // Signature: (&[f64], Option<&mut [f64]>, &mut UserData) -> f64
     let objective = move |x: &[f64], _grad: Option<&mut [f64]>, _: &mut ()| -> f64 {
-        fev_counter.set(fev_counter.get() + 1);
-        func(x)
+        let n = fev_counter.get() + 1;
+        fev_counter.set(n);
+        let val = func(x);
+        if disp {
+            println!("  [{:?} eval #{:>3}] f = {:+.6e}", algo, n, val);
+        }
+        val
     };
 
     // Create NLOPT optimizer
@@ -312,6 +323,19 @@ where
     let result = opt.optimize(&mut x);
 
     let final_fev = fev_count.get();
+
+    if disp {
+        match &result {
+            Ok((state, fval)) => println!(
+                "  [{:?}] {:?}: f_best = {:+.6e} ({} evals)",
+                algo, state, fval, final_fev
+            ),
+            Err((state, fval)) => println!(
+                "  [{:?}] FAILED {:?}: f_best = {:+.6e} ({} evals)",
+                algo, state, fval, final_fev
+            ),
+        }
+    }
 
     match result {
         Ok((success_state, fval)) => LocalOptResult {
@@ -386,11 +410,22 @@ where
     // Track function evaluations using interior mutability
     let fev_count = Rc::new(Cell::new(0usize));
     let fev_counter = Rc::clone(&fev_count);
+    let disp = options.disp;
+    let algo_enum = if options.algorithm.supports_constraints() {
+        options.algorithm
+    } else {
+        LocalOptimizer::Cobyla
+    };
 
     // Create the objective function wrapper
     let objective = move |x: &[f64], _grad: Option<&mut [f64]>, _: &mut ()| -> f64 {
-        fev_counter.set(fev_counter.get() + 1);
-        func(x)
+        let n = fev_counter.get() + 1;
+        fev_counter.set(n);
+        let val = func(x);
+        if disp {
+            println!("  [{:?} eval #{:>3}] f = {:+.6e}", algo_enum, n, val);
+        }
+        val
     };
 
     // Create NLOPT optimizer
@@ -448,6 +483,19 @@ where
     let result = opt.optimize(&mut x);
 
     let final_fev = fev_count.get();
+
+    if disp {
+        match &result {
+            Ok((state, fval)) => println!(
+                "  [{:?}] {:?}: f_best = {:+.6e} ({} evals)",
+                algo_enum, state, fval, final_fev
+            ),
+            Err((state, fval)) => println!(
+                "  [{:?}] FAILED {:?}: f_best = {:+.6e} ({} evals)",
+                algo_enum, state, fval, final_fev
+            ),
+        }
+    }
 
     match result {
         Ok((success_state, fval)) => LocalOptResult {

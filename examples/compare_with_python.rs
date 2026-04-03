@@ -5,7 +5,7 @@
 //!
 //! Run with: cargo run --example compare_with_python --release
 
-use shgo::{Shgo, ShgoOptions, SamplingMethod, LocalOptimizer};
+use shgo::{Shgo, ShgoOptions, SamplingMethod, LocalOptimizer, LocalOptimizerOptions};
 use std::time::Instant;
 
 // ===== Test Functions =====
@@ -167,10 +167,12 @@ fn run_test_constrained<
         iters,
         maxiter,
         disp: 0,
-        local_optimizer: LocalOptimizer::Cobyla,
+        local_options: LocalOptimizerOptions {
+            algorithm: LocalOptimizer::Cobyla,
+            ..LocalOptimizerOptions::default()
+        },
         ..Default::default()
     };
-    options.local_options.algorithm = LocalOptimizer::Cobyla;
     if n > 0 {
         options.n = n;
     }

@@ -133,6 +133,7 @@ impl Default for ShgoOptions_C {
 
 impl From<ShgoOptions_C> for ShgoOptions {
     fn from(opts: ShgoOptions_C) -> Self {
+        let algorithm: crate::local_opt::LocalOptimizer = opts.local_optimizer.into();
         ShgoOptions {
             n: opts.n,
             maxiter: if opts.maxiter == 0 { None } else { Some(opts.maxiter) },
@@ -141,7 +142,10 @@ impl From<ShgoOptions_C> for ShgoOptions {
             f_tol: opts.f_tol,
             disp: opts.disp,
             sampling_method: opts.sampling_method.into(),
-            local_optimizer: opts.local_optimizer.into(),
+            local_options: crate::local_opt::LocalOptimizerOptions {
+                algorithm,
+                ..crate::local_opt::LocalOptimizerOptions::default()
+            },
             workers: if opts.workers == 0 { None } else { Some(opts.workers) },
             minimize_every_iter: opts.minimize_every_iter,
             ..Default::default()

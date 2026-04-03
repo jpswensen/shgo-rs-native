@@ -6,7 +6,7 @@
 //! Build: RUSTFLAGS="-C target-cpu=native" cargo build --example performance_benchmark --release
 //! Run:   ./target/release/examples/performance_benchmark
 
-use shgo::{Shgo, ShgoOptions, SamplingMethod, LocalOptimizer};
+use shgo::{Shgo, ShgoOptions, SamplingMethod, LocalOptimizer, LocalOptimizerOptions};
 use std::time::Instant;
 
 // ===== Test Functions =====
@@ -194,10 +194,12 @@ fn bench_constrained<
             iters,
             maxiter,
             disp: 0,
-            local_optimizer: LocalOptimizer::Cobyla,
+            local_options: LocalOptimizerOptions {
+                algorithm: LocalOptimizer::Cobyla,
+                ..LocalOptimizerOptions::default()
+            },
             ..Default::default()
         };
-        options.local_options.algorithm = LocalOptimizer::Cobyla;
         if n > 0 {
             options.n = n;
         }

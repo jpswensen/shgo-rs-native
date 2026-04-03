@@ -3,7 +3,7 @@
 //! The Rastrigin function is a non-convex function with many local minima,
 //! making it a challenging test case for global optimization algorithms.
 
-use shgo::{Shgo, ShgoOptions, SamplingMethod, LocalOptimizer};
+use shgo::{Shgo, ShgoOptions, SamplingMethod, LocalOptimizer, LocalOptimizerOptions};
 use std::time::Instant;
 
 /// N-dimensional Rastrigin function
@@ -108,7 +108,10 @@ fn main() {
     for optimizer in [LocalOptimizer::Bobyqa, LocalOptimizer::NelderMead, LocalOptimizer::Cobyla] {
         let options = ShgoOptions {
             maxiter: Some(3),
-            local_optimizer: optimizer,
+            local_options: LocalOptimizerOptions {
+                algorithm: optimizer,
+                ..LocalOptimizerOptions::default()
+            },
             disp: 0,
             ..Default::default()
         };

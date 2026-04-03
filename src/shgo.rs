@@ -149,13 +149,11 @@ pub struct ShgoOptions {
     /// Default: 1e50
     pub infty_constraints: f64,
 
-    /// Local optimizer algorithm to use.
-    /// Default: BOBYQA (Bound Optimization BY Quadratic Approximation,
-    /// derivative-free, supports bounds)
-    pub local_optimizer: crate::local_opt::LocalOptimizer,
-
-    /// Options for the local optimizer.
-    /// Default: LocalOptimizerOptions::default()
+    /// Options for the local optimizer (including which algorithm to use).
+    /// The algorithm is controlled by `local_options.algorithm`.
+    /// When constraints are provided and the chosen algorithm doesn't support them,
+    /// SHGO will automatically upgrade to Cobyla.
+    /// Default: LocalOptimizerOptions with Bobyqa algorithm
     pub local_options: crate::local_opt::LocalOptimizerOptions,
 
     /// Number of worker threads for parallel execution.
@@ -183,7 +181,6 @@ impl Default for ShgoOptions {
             disp: 0,
             sobol_skip: 0,
             infty_constraints: 1e50,
-            local_optimizer: crate::local_opt::LocalOptimizer::Bobyqa,
             local_options: crate::local_opt::LocalOptimizerOptions {
                 algorithm: crate::local_opt::LocalOptimizer::Bobyqa,
                 ftol_rel: 1e-12,
@@ -1250,7 +1247,18 @@ where
 
         // Create options for local optimization
         let mut local_opts = self.options.local_options.clone();
-        local_opts.algorithm = self.options.local_optimizer;
+
+        // Auto-upgrade: if constraints exist but the chosen algorithm doesn't
+        // support them, switch to Cobyla (which does).
+        if !self.constraints.is_empty() && !local_opts.algorithm.supports_constraints() {
+            if self.options.disp > 0 {
+                eprintln!(
+                    "Warning: {:?} does not support constraints, auto-upgrading to Cobyla",
+                    local_opts.algorithm
+                );
+            }
+            local_opts.algorithm = crate::local_opt::LocalOptimizer::Cobyla;
+        }
 
         // Clone the function for local optimization (without evaluation counting,
         // since local evals are tracked separately via lmap_cache.total_fev())
@@ -1703,7 +1711,10 @@ mod tests {
         // Test with BOBYQA (default)
         let options_bobyqa = ShgoOptions {
             maxiter: Some(2),
-            local_optimizer: LocalOptimizer::Bobyqa,
+            local_options: crate::local_opt::LocalOptimizerOptions {
+                algorithm: LocalOptimizer::Bobyqa,
+                ..crate::local_opt::LocalOptimizerOptions::default()
+            },
             ..Default::default()
         };
         
@@ -1715,7 +1726,10 @@ mod tests {
         // Test with Nelder-Mead
         let options_nm = ShgoOptions {
             maxiter: Some(2),
-            local_optimizer: LocalOptimizer::NelderMead,
+            local_options: crate::local_opt::LocalOptimizerOptions {
+                algorithm: LocalOptimizer::NelderMead,
+                ..crate::local_opt::LocalOptimizerOptions::default()
+            },
             ..Default::default()
         };
         
