@@ -922,6 +922,26 @@ where
                     let qh = qhull::Qh::new_delaunay(
                         points.iter().map(|p| p.iter().cloned()),
                     )
+                    .or_else(|_| {
+                        // Retry with joggled points: add tiny random perturbation
+                        // to break cocircular/cospherical degeneracies (equivalent
+                        // to Qhull's QJ option).
+                        if self.options.disp > 0 {
+                            eprintln!("Warning: Delaunay triangulation failed (cocircular points), retrying with joggled input");
+                        }
+                        let scale = 1e-10;
+                        let joggled: Vec<Vec<f64>> = points.iter().enumerate().map(|(pi, p)| {
+                            p.iter().enumerate().map(|(ci, &v)| {
+                                // Deterministic jitter unique per (point, coordinate)
+                                let hash = ((pi * 31 + ci + 1) as f64) * 0.618033988749895;
+                                let jitter = (hash.fract() - 0.5) * 2.0 * scale;
+                                v + jitter
+                            }).collect()
+                        }).collect();
+                        qhull::Qh::new_delaunay(
+                            joggled.iter().map(|p| p.iter().cloned()),
+                        )
+                    })
                     .map_err(|e| {
                         ShgoError::MeshGeneration(format!(
                             "Delaunay triangulation failed: {}",
