@@ -3,15 +3,22 @@
 //! The [`Coordinates`] type provides an immutable representation of a point
 //! in n-dimensional space that can be efficiently hashed and compared for
 //! use as keys in the vertex cache.
+//!
+//! Uses [`SmallVec`] internally to avoid heap allocation for dimensions ≤ 8.
 
 use std::fmt;
 use std::hash::{Hash, Hasher};
+
+use smallvec::SmallVec;
 
 /// Immutable coordinates representing a point in n-dimensional space.
 ///
 /// Coordinates are designed to be used as keys in hash maps. They implement
 /// [`Hash`] and [`Eq`] based on the bit representation of the floating-point
 /// values, ensuring consistent hashing behavior.
+///
+/// Internally uses [`SmallVec<[f64; 8]>`] to store values inline for
+/// dimensions ≤ 8, avoiding heap allocation for common problem sizes.
 ///
 /// # Example
 ///
@@ -24,8 +31,8 @@ use std::hash::{Hash, Hasher};
 /// ```
 #[derive(Clone, PartialOrd)]
 pub struct Coordinates {
-    /// The coordinate values.
-    values: Vec<f64>,
+    /// The coordinate values (inline for dim ≤ 8).
+    values: SmallVec<[f64; 8]>,
     /// Pre-computed hash for O(1) hash lookups.
     cached_hash: u64,
 }
@@ -46,8 +53,9 @@ impl Coordinates {
     /// assert_eq!(coords.dim(), 3);
     /// ```
     pub fn new(values: Vec<f64>) -> Self {
-        let cached_hash = Self::compute_hash(&values);
-        Self { values, cached_hash }
+        let sv: SmallVec<[f64; 8]> = SmallVec::from_vec(values);
+        let cached_hash = Self::compute_hash(&sv);
+        Self { values: sv, cached_hash }
     }
 
     /// Create coordinates from a slice.
@@ -116,7 +124,7 @@ impl Coordinates {
     /// Convert to a Vec, consuming the coordinates.
     #[inline]
     pub fn into_vec(self) -> Vec<f64> {
-        self.values
+        self.values.into_vec()
     }
 
     /// Recompute the cached hash after modification.
@@ -161,13 +169,14 @@ impl Coordinates {
             other.dim(),
             "Cannot compute midpoint of coordinates with different dimensions"
         );
-        let values: Vec<f64> = self
+        let values: SmallVec<[f64; 8]> = self
             .values
             .iter()
             .zip(other.values.iter())
             .map(|(a, b)| (a + b) / 2.0)
             .collect();
-        Coordinates::new(values)
+        let cached_hash = Self::compute_hash(&values);
+        Coordinates { values, cached_hash }
     }
 
     /// Compute the Euclidean distance to another coordinate.
@@ -292,13 +301,15 @@ impl From<&[f64]> for Coordinates {
 
 impl<const N: usize> From<[f64; N]> for Coordinates {
     fn from(values: [f64; N]) -> Self {
-        Self::new(values.to_vec())
+        let sv: SmallVec<[f64; 8]> = SmallVec::from_slice(&values);
+        let cached_hash = Self::compute_hash(&sv);
+        Self { values: sv, cached_hash }
     }
 }
 
 impl AsRef<[f64]> for Coordinates {
     fn as_ref(&self) -> &[f64] {
-        &self.values
+        self.values.as_slice()
     }
 }
 

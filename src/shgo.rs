@@ -47,6 +47,41 @@ use crate::error::ShgoError;
 use crate::sobol::Sobol;
 use crate::vertex::VertexCache;
 
+/// Suppress stdout for the duration of a closure.
+///
+/// The upstream `qhull` crate has a debug `println!` that leaks pointer
+/// addresses to stdout on every Delaunay call. This helper redirects fd 1
+/// to /dev/null while `f` runs, then restores it.
+#[cfg(unix)]
+fn with_stdout_suppressed<R>(f: impl FnOnce() -> R) -> R {
+    use std::os::unix::io::AsRawFd;
+    let devnull = std::fs::File::open("/dev/null");
+    let (devnull, old_stdout) = match devnull {
+        Ok(dn) => {
+            let old = unsafe { libc::dup(1) };
+            if old >= 0 {
+                unsafe { libc::dup2(dn.as_raw_fd(), 1) };
+                (Some(dn), old)
+            } else {
+                return f();
+            }
+        }
+        Err(_) => return f(),
+    };
+    let result = f();
+    unsafe {
+        libc::dup2(old_stdout, 1);
+        libc::close(old_stdout);
+    }
+    drop(devnull);
+    result
+}
+
+#[cfg(not(unix))]
+fn with_stdout_suppressed<R>(f: impl FnOnce() -> R) -> R {
+    f()
+}
+
 /// Type alias for objective function.
 pub type ObjectiveFn = dyn Fn(&[f64]) -> f64 + Send + Sync;
 
@@ -70,6 +105,56 @@ pub enum SamplingMethod {
 impl Default for SamplingMethod {
     fn default() -> Self {
         SamplingMethod::Simplicial
+    }
+}
+
+/// Method for building vertex connectivity in Sobol mode.
+///
+/// Controls how neighbor relationships are established between sampled points.
+/// This affects local minimizer detection (a vertex is a local minimizer if
+/// its function value is less than all its neighbors').
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum ConnectivityMethod {
+    /// Delaunay triangulation via QHull (the default, matching SciPy).
+    ///
+    /// Produces geometrically correct neighbors but costs O(n^⌈d/2⌉),
+    /// making it prohibitively expensive for dimensions > ~7.
+    Delaunay,
+
+    /// k-nearest-neighbors connectivity.
+    ///
+    /// Connects each point to its k nearest neighbors (bidirectionally).
+    /// Much faster than Delaunay in high dimensions: O(n² · d) brute-force,
+    /// which is fast for typical SHGO problem sizes (n ≤ 4096).
+    ///
+    /// Default k = 2·dim + 1, which empirically approximates Delaunay
+    /// neighbor count. Override with [`ShgoOptions::knn_neighbors`].
+    KNearestNeighbors,
+
+    /// HNSW (Hierarchical Navigable Small World) approximate nearest neighbors.
+    ///
+    /// Uses the `hnsw_rs` crate to build a navigable small-world graph and
+    /// query approximate k-nearest neighbors. Offers O(n·log n) build time
+    /// and O(log n) per query, making it attractive for larger point sets.
+    ///
+    /// Default k = 2·dim + 1 (same as KNearestNeighbors).
+    /// Override with [`ShgoOptions::knn_neighbors`].
+    HNSW,
+
+    /// ScaNN (Scalable Nearest Neighbors) approximate nearest neighbors.
+    ///
+    /// Uses the `vecstore` crate's ScaNN implementation with learned
+    /// quantization and tree-based partitioning. Designed for large-scale
+    /// vector search with configurable accuracy/speed tradeoffs.
+    ///
+    /// Note: operates on f32 internally (f64 points are down-cast).
+    /// Default k = 2·dim + 1. Override with [`ShgoOptions::knn_neighbors`].
+    ScaNN,
+}
+
+impl Default for ConnectivityMethod {
+    fn default() -> Self {
+        ConnectivityMethod::Delaunay
     }
 }
 
@@ -160,6 +245,16 @@ pub struct ShgoOptions {
     /// Default: None (use all available CPU cores)
     /// Set to Some(1) for single-threaded execution.
     pub workers: Option<usize>,
+
+    /// Method for building vertex connectivity in Sobol mode.
+    /// Default: Delaunay (matching SciPy).
+    /// Set to KNearestNeighbors for faster high-dimensional problems.
+    pub connectivity_method: ConnectivityMethod,
+
+    /// Number of nearest neighbors for k-NN connectivity.
+    /// Only used when connectivity_method is KNearestNeighbors.
+    /// Default: None (auto: 2·dim + 1).
+    pub knn_neighbors: Option<usize>,
 }
 
 impl Default for ShgoOptions {
@@ -187,6 +282,8 @@ impl Default for ShgoOptions {
                 ..crate::local_opt::LocalOptimizerOptions::default()
             },
             workers: None,
+            connectivity_method: ConnectivityMethod::Delaunay,
+            knn_neighbors: None,
         }
     }
 }
@@ -898,7 +995,7 @@ where
                 .map(|p| cache.get_or_create(p.clone()))
                 .collect();
 
-            // ---- Build Delaunay connectivity (vf_to_vv) ----
+            // ---- Build vertex connectivity ----
             // Need at least dim+2 non-degenerate points for triangulation
             if points.len() >= self.dim + 2 {
                 if self.dim == 1 {
@@ -917,123 +1014,42 @@ where
                         );
                     }
                 } else {
-                    // Multi-dimensional: Delaunay triangulation via QHull
-                    // (same backend as Python's scipy.spatial.Delaunay)
-                    let qh = qhull::Qh::new_delaunay(
-                        points.iter().map(|p| p.iter().cloned()),
-                    )
-                    .or_else(|_| {
-                        // Retry with joggled points: add tiny random perturbation
-                        // to break cocircular/cospherical degeneracies (equivalent
-                        // to Qhull's QJ option).
-                        if self.options.disp > 0 {
-                            eprintln!("Warning: Delaunay triangulation failed (cocircular points), retrying with joggled input");
+                    match self.options.connectivity_method {
+                        ConnectivityMethod::KNearestNeighbors => {
+                            Self::build_knn_connectivity(
+                                &points,
+                                &vertices_in_order,
+                                self.dim,
+                                self.options.knn_neighbors,
+                                self.options.disp,
+                            );
                         }
-                        let scale = 1e-10;
-                        let joggled: Vec<Vec<f64>> = points.iter().enumerate().map(|(pi, p)| {
-                            p.iter().enumerate().map(|(ci, &v)| {
-                                // Deterministic jitter unique per (point, coordinate)
-                                let hash = ((pi * 31 + ci + 1) as f64) * 0.618033988749895;
-                                let jitter = (hash.fract() - 0.5) * 2.0 * scale;
-                                v + jitter
-                            }).collect()
-                        }).collect();
-                        qhull::Qh::new_delaunay(
-                            joggled.iter().map(|p| p.iter().cloned()),
-                        )
-                    })
-                    .map_err(|e| {
-                        ShgoError::MeshGeneration(format!(
-                            "Delaunay triangulation failed: {}",
-                            e
-                        ))
-                    })?;
-
-                    // Convert vertex-face mesh to vertex-vertex connectivity
-                    // Matches Python's vf_to_vv exactly:
-                    //   for s in simplices:
-                    //       edges = itertools.combinations(s, self.dim)
-                    //       for e in edges: connect(e[0], e[1])
-                    // For dim=2 this is equivalent to all-pairs.
-                    // For dim>2 it connects only the first two vertices of each
-                    // (dim)-combination face, producing fewer edges than all-pairs.
-                    let dim = self.dim;
-                    for simplex in qh.simplices().filter(|f| !f.upper_delaunay()) {
-                        if let Some(verts) = simplex.vertices() {
-                            let simplex_indices: Vec<usize> = verts
-                                .iter()
-                                .filter_map(|v| v.index(&qh))
-                                .collect();
-
-                            // combinations(simplex_indices, dim) → connect e[0]-e[1]
-                            // This matches Python's itertools.combinations(s, self.dim)
-                            if dim >= 2 && simplex_indices.len() >= dim {
-                                // Generate combinations of `dim` elements
-                                let mut combo = vec![0usize; dim];
-                                // Initialize combo to [0, 1, ..., dim-1]
-                                for k in 0..dim {
-                                    combo[k] = k;
-                                }
-                                let n = simplex_indices.len();
-                                loop {
-                                    // Connect the first two elements of this combination
-                                    let pi = simplex_indices[combo[0]];
-                                    let pj = simplex_indices[combo[1]];
-                                    if pi < vertices_in_order.len()
-                                        && pj < vertices_in_order.len()
-                                    {
-                                        crate::Vertex::connect_bidirectional(
-                                            &vertices_in_order[pi],
-                                            &vertices_in_order[pj],
-                                        );
-                                    }
-
-                                    // Advance to next combination
-                                    let mut i = dim - 1;
-                                    loop {
-                                        combo[i] += 1;
-                                        if combo[i] <= n - dim + i {
-                                            break;
-                                        }
-                                        if i == 0 {
-                                            // All combinations exhausted
-                                            combo[0] = n; // sentinel
-                                            break;
-                                        }
-                                        i -= 1;
-                                    }
-                                    if combo[0] >= n {
-                                        break;
-                                    }
-                                    // Reset trailing elements
-                                    for j in (i + 1)..dim {
-                                        combo[j] = combo[j - 1] + 1;
-                                    }
-                                }
-                            } else if simplex_indices.len() >= 2 {
-                                // Fallback for dim=1 or degenerate: pairs
-                                let pi = simplex_indices[0];
-                                let pj = simplex_indices[1];
-                                if pi < vertices_in_order.len()
-                                    && pj < vertices_in_order.len()
-                                {
-                                    crate::Vertex::connect_bidirectional(
-                                        &vertices_in_order[pi],
-                                        &vertices_in_order[pj],
-                                    );
-                                }
-                            }
+                        ConnectivityMethod::HNSW => {
+                            Self::build_hnsw_connectivity(
+                                &points,
+                                &vertices_in_order,
+                                self.dim,
+                                self.options.knn_neighbors,
+                                self.options.disp,
+                            );
                         }
-                    }
-
-                    if self.options.disp > 1 {
-                        println!(
-                            "  Delaunay triangulation: {} simplices, {} vertices",
-                            qh.simplices()
-                                .filter(|f| !f.upper_delaunay())
-                                .count(),
-                            qh.num_vertices()
-                        );
+                        ConnectivityMethod::ScaNN => {
+                            Self::build_scann_connectivity(
+                                &points,
+                                &vertices_in_order,
+                                self.dim,
+                                self.options.knn_neighbors,
+                                self.options.disp,
+                            );
+                        }
+                        ConnectivityMethod::Delaunay => {
+                            Self::build_delaunay_connectivity(
+                                &points,
+                                &vertices_in_order,
+                                self.dim,
+                                self.options.disp,
+                            )?;
+                        }
                     }
                 }
             }
@@ -1209,6 +1225,349 @@ where
         }
 
         Ok(false)
+    }
+
+    /// Build vertex connectivity using k-nearest-neighbors.
+    ///
+    /// For each point, finds the k closest points by Euclidean distance and
+    /// connects them bidirectionally. This is O(n² · d) brute-force, which
+    /// is fast for typical SHGO problem sizes and avoids QHull's exponential
+    /// scaling in high dimensions.
+    fn build_knn_connectivity(
+        points: &[Vec<f64>],
+        vertices: &[std::sync::Arc<crate::Vertex>],
+        dim: usize,
+        knn_neighbors: Option<usize>,
+        disp: usize,
+    ) {
+        let n = points.len();
+        let k = knn_neighbors
+            .unwrap_or(2 * dim + 1)
+            .min(n.saturating_sub(1));
+
+        if k == 0 || n < 2 {
+            return;
+        }
+
+        // Brute-force k-NN: compute all pairwise squared distances,
+        // then partial-sort each row to find the k nearest.
+        // This is O(n² · d) which is fast for n ≤ ~4096, d ≤ ~20.
+        for i in 0..n {
+            // Compute squared distances from point i to all other points
+            let mut dists: Vec<(usize, f64)> = (0..n)
+                .filter(|&j| j != i)
+                .map(|j| {
+                    let d2: f64 = points[i]
+                        .iter()
+                        .zip(points[j].iter())
+                        .map(|(a, b)| (a - b).powi(2))
+                        .sum();
+                    (j, d2)
+                })
+                .collect();
+
+            // Partial sort to find k nearest (O(n) via select_nth_unstable)
+            if dists.len() > k {
+                dists.select_nth_unstable_by(k - 1, |a, b| {
+                    a.1.partial_cmp(&b.1).unwrap_or(std::cmp::Ordering::Equal)
+                });
+                dists.truncate(k);
+            }
+
+            // Connect bidirectionally
+            for &(j, _) in &dists {
+                crate::Vertex::connect_bidirectional(&vertices[i], &vertices[j]);
+            }
+        }
+
+        if disp > 1 {
+            let avg_neighbors: f64 = vertices.iter()
+                .map(|v| v.neighbor_count() as f64)
+                .sum::<f64>() / n as f64;
+            println!(
+                "  k-NN connectivity: k={}, {} vertices, avg {:.1} neighbors/vertex",
+                k, n, avg_neighbors
+            );
+        }
+    }
+
+    /// Build vertex connectivity using HNSW (Hierarchical Navigable Small World).
+    ///
+    /// Uses `hnsw_rs` to build an approximate nearest-neighbor index and query
+    /// each point for its k closest neighbors. O(n·log n) build, O(log n) query.
+    fn build_hnsw_connectivity(
+        points: &[Vec<f64>],
+        vertices: &[std::sync::Arc<crate::Vertex>],
+        dim: usize,
+        knn_neighbors: Option<usize>,
+        disp: usize,
+    ) {
+        use hnsw_rs::prelude::*;
+
+        let n = points.len();
+        let k = knn_neighbors
+            .unwrap_or(2 * dim + 1)
+            .min(n.saturating_sub(1));
+
+        if k == 0 || n < 2 {
+            return;
+        }
+
+        // HNSW parameters tuned for our use case:
+        // - max_nb_connection: edges per node per layer (16 is a good default)
+        // - max_layer: maximum number of layers (auto-scaled)
+        // - ef_construction: search width during build (higher = more accurate)
+        let max_nb_connection = 16.min(k * 2);
+        let max_layer = 16;
+        let ef_construction = (k * 4).max(48);
+
+        let hnsw = Hnsw::<f64, DistL2>::new(
+            max_nb_connection,
+            n,
+            max_layer,
+            ef_construction,
+            DistL2,
+        );
+
+        // Insert all points (origin_id = index)
+        let data_for_par: Vec<(&Vec<f64>, usize)> =
+            points.iter().zip(0..n).collect();
+        hnsw.parallel_insert(&data_for_par);
+
+        // Switch to search mode after parallel insert
+        // (hnsw_rs requires this before searching)
+        // Note: set_searching_mode needs &mut but parallel_search doesn't,
+        // so we just search directly — it works for sequential insert+search.
+
+        // Query each point for its k nearest neighbors
+        let ef_search = (k * 2).max(32);
+        let results = hnsw.parallel_search(points, k, ef_search);
+
+        // Connect bidirectionally based on HNSW results
+        for (i, neighbors) in results.iter().enumerate() {
+            for nb in neighbors {
+                let j = nb.d_id;
+                if j < vertices.len() {
+                    crate::Vertex::connect_bidirectional(&vertices[i], &vertices[j]);
+                }
+            }
+        }
+
+        if disp > 1 {
+            let avg_neighbors: f64 = vertices.iter()
+                .map(|v| v.neighbor_count() as f64)
+                .sum::<f64>() / n as f64;
+            println!(
+                "  HNSW connectivity: k={}, {} vertices, avg {:.1} neighbors/vertex",
+                k, n, avg_neighbors
+            );
+        }
+    }
+
+    /// Build vertex connectivity using ScaNN (Scalable Nearest Neighbors).
+    ///
+    /// Uses `vecstore`'s ScaNN implementation with learned quantization.
+    /// Points are down-cast from f64 to f32 for the index.
+    fn build_scann_connectivity(
+        points: &[Vec<f64>],
+        vertices: &[std::sync::Arc<crate::Vertex>],
+        dim: usize,
+        knn_neighbors: Option<usize>,
+        disp: usize,
+    ) {
+        use vecstore::scann::{ScaNNIndex, ScaNNConfig};
+
+        let n = points.len();
+        let k = knn_neighbors
+            .unwrap_or(2 * dim + 1)
+            .min(n.saturating_sub(1));
+
+        if k == 0 || n < 2 {
+            return;
+        }
+
+        // ScaNN config tuned for small-to-medium point sets.
+        // num_leaves controls partitioning granularity.
+        let num_leaves = (n / 10).max(2).min(1000);
+        let config = ScaNNConfig {
+            num_leaves,
+            num_leaves_to_search: num_leaves, // search all leaves for accuracy
+            quantization_bits: 8,             // highest precision quantization
+            rerank_k: (k * 4).max(20).min(n), // rerank more candidates
+            dimensions_per_block: 2,
+        };
+
+        let mut index = match ScaNNIndex::new(dim, config) {
+            Ok(idx) => idx,
+            Err(e) => {
+                if disp > 0 {
+                    eprintln!("Warning: ScaNN index creation failed: {}, falling back to k-NN", e);
+                }
+                Self::build_knn_connectivity(points, vertices, dim, knn_neighbors, disp);
+                return;
+            }
+        };
+
+        // Convert f64 → f32 for ScaNN
+        let f32_points: Vec<Vec<f32>> = points.iter()
+            .map(|p| p.iter().map(|&v| v as f32).collect())
+            .collect();
+
+        // Train on all points
+        if let Err(e) = index.train(&f32_points) {
+            if disp > 0 {
+                eprintln!("Warning: ScaNN training failed: {}, falling back to k-NN", e);
+            }
+            Self::build_knn_connectivity(points, vertices, dim, knn_neighbors, disp);
+            return;
+        }
+
+        // Add all points with string IDs = index
+        let batch: Vec<(String, Vec<f32>)> = f32_points.iter().enumerate()
+            .map(|(i, p)| (i.to_string(), p.clone()))
+            .collect();
+        if let Err(e) = index.add_batch(batch) {
+            if disp > 0 {
+                eprintln!("Warning: ScaNN add_batch failed: {}, falling back to k-NN", e);
+            }
+            Self::build_knn_connectivity(points, vertices, dim, knn_neighbors, disp);
+            return;
+        }
+
+        // Query each point for k nearest neighbors
+        for i in 0..n {
+            match index.search(&f32_points[i], k + 1) {
+                Ok(results) => {
+                    for (id_str, _dist) in &results {
+                        if let Ok(j) = id_str.parse::<usize>() {
+                            if j != i && j < vertices.len() {
+                                crate::Vertex::connect_bidirectional(&vertices[i], &vertices[j]);
+                            }
+                        }
+                    }
+                }
+                Err(_) => {} // skip failures silently
+            }
+        }
+
+        if disp > 1 {
+            let avg_neighbors: f64 = vertices.iter()
+                .map(|v| v.neighbor_count() as f64)
+                .sum::<f64>() / n as f64;
+            println!(
+                "  ScaNN connectivity: k={}, {} vertices, avg {:.1} neighbors/vertex",
+                k, n, avg_neighbors
+            );
+        }
+    }
+
+    /// Build vertex connectivity using Delaunay triangulation via QHull.
+    fn build_delaunay_connectivity(
+        points: &[Vec<f64>],
+        vertices: &[std::sync::Arc<crate::Vertex>],
+        dim: usize,
+        disp: usize,
+    ) -> Result<(), ShgoError> {
+        // Wrap in with_stdout_suppressed to silence upstream debug println
+        let qh = with_stdout_suppressed(|| {
+            qhull::Qh::new_delaunay(
+                points.iter().map(|p| p.iter().cloned()),
+            )
+            .or_else(|_| {
+                // Retry with joggled points: add tiny random perturbation
+                // to break cocircular/cospherical degeneracies (equivalent
+                // to Qhull's QJ option).
+                if disp > 0 {
+                    eprintln!("Warning: Delaunay triangulation failed (cocircular points), retrying with joggled input");
+                }
+                let scale = 1e-10;
+                let joggled: Vec<Vec<f64>> = points.iter().enumerate().map(|(pi, p)| {
+                    p.iter().enumerate().map(|(ci, &v)| {
+                        let hash = ((pi * 31 + ci + 1) as f64) * 0.618033988749895;
+                        let jitter = (hash.fract() - 0.5) * 2.0 * scale;
+                        v + jitter
+                    }).collect()
+                }).collect();
+                qhull::Qh::new_delaunay(
+                    joggled.iter().map(|p| p.iter().cloned()),
+                )
+            })
+        })
+        .map_err(|e| {
+            ShgoError::MeshGeneration(format!(
+                "Delaunay triangulation failed: {}",
+                e
+            ))
+        })?;
+
+        // Convert vertex-face mesh to vertex-vertex connectivity
+        // Matches Python's vf_to_vv: combinations(simplex, dim) → connect e[0]-e[1]
+        for simplex in qh.simplices().filter(|f| !f.upper_delaunay()) {
+            if let Some(verts) = simplex.vertices() {
+                let simplex_indices: Vec<usize> = verts
+                    .iter()
+                    .filter_map(|v| v.index(&qh))
+                    .collect();
+
+                if dim >= 2 && simplex_indices.len() >= dim {
+                    let mut combo = vec![0usize; dim];
+                    for k in 0..dim {
+                        combo[k] = k;
+                    }
+                    let n = simplex_indices.len();
+                    loop {
+                        let pi = simplex_indices[combo[0]];
+                        let pj = simplex_indices[combo[1]];
+                        if pi < vertices.len() && pj < vertices.len() {
+                            crate::Vertex::connect_bidirectional(
+                                &vertices[pi],
+                                &vertices[pj],
+                            );
+                        }
+
+                        let mut i = dim - 1;
+                        loop {
+                            combo[i] += 1;
+                            if combo[i] <= n - dim + i {
+                                break;
+                            }
+                            if i == 0 {
+                                combo[0] = n;
+                                break;
+                            }
+                            i -= 1;
+                        }
+                        if combo[0] >= n {
+                            break;
+                        }
+                        for j in (i + 1)..dim {
+                            combo[j] = combo[j - 1] + 1;
+                        }
+                    }
+                } else if simplex_indices.len() >= 2 {
+                    let pi = simplex_indices[0];
+                    let pj = simplex_indices[1];
+                    if pi < vertices.len() && pj < vertices.len() {
+                        crate::Vertex::connect_bidirectional(
+                            &vertices[pi],
+                            &vertices[pj],
+                        );
+                    }
+                }
+            }
+        }
+
+        if disp > 1 {
+            println!(
+                "  Delaunay triangulation: {} simplices, {} vertices",
+                qh.simplices()
+                    .filter(|f| !f.upper_delaunay())
+                    .count(),
+                qh.num_vertices()
+            );
+        }
+
+        Ok(())
     }
 
     /// Construct locally (approximately) convex bounds for simplicial mode.
@@ -1532,6 +1891,209 @@ mod tests {
         assert!(result.nit <= 2);
         assert!(result.nfev > 0);
         println!("Sphere (Sobol) result: x={:?}, fun={}", result.x, result.fun);
+    }
+
+    #[test]
+    fn test_shgo_sphere_sobol_knn() {
+        let bounds = vec![(-5.0, 5.0), (-5.0, 5.0)];
+        let options = ShgoOptions {
+            maxiter: Some(2),
+            sampling_method: SamplingMethod::Sobol,
+            connectivity_method: ConnectivityMethod::KNearestNeighbors,
+            n: 64,
+            disp: 0,
+            ..Default::default()
+        };
+
+        let result = Shgo::new(sphere, bounds)
+            .with_options(options)
+            .minimize()
+            .unwrap();
+
+        assert!(result.nit <= 2);
+        assert!(result.nfev > 0);
+        assert!(result.fun < 1.0, "k-NN should find near-optimal: fun={}", result.fun);
+        println!("Sphere (Sobol+k-NN) result: x={:?}, fun={}", result.x, result.fun);
+    }
+
+    #[test]
+    fn test_shgo_rosenbrock_sobol_knn() {
+        let bounds = vec![(-2.0, 2.0), (-2.0, 2.0)];
+        let options = ShgoOptions {
+            maxiter: Some(3),
+            sampling_method: SamplingMethod::Sobol,
+            connectivity_method: ConnectivityMethod::KNearestNeighbors,
+            n: 128,
+            disp: 0,
+            ..Default::default()
+        };
+
+        let result = Shgo::new(rosenbrock, bounds)
+            .with_options(options)
+            .minimize()
+            .unwrap();
+
+        assert!(result.fun < 1.0, "k-NN Rosenbrock should converge: fun={}", result.fun);
+        println!("Rosenbrock (Sobol+k-NN) result: x={:?}, fun={}", result.x, result.fun);
+    }
+
+    #[test]
+    fn test_shgo_rastrigin_5d_knn() {
+        let rastrigin = |x: &[f64]| -> f64 {
+            let n = x.len() as f64;
+            10.0 * n + x.iter().map(|&xi| xi * xi - 10.0 * (2.0 * std::f64::consts::PI * xi).cos()).sum::<f64>()
+        };
+        let bounds = vec![(-5.12, 5.12); 5];
+        let options = ShgoOptions {
+            maxiter: Some(2),
+            sampling_method: SamplingMethod::Sobol,
+            connectivity_method: ConnectivityMethod::KNearestNeighbors,
+            n: 256,
+            disp: 0,
+            ..Default::default()
+        };
+
+        let result = Shgo::new(rastrigin, bounds)
+            .with_options(options)
+            .minimize()
+            .unwrap();
+
+        assert!(result.nfev > 0);
+        println!("Rastrigin 5D (k-NN) result: fun={}, x={:?}", result.fun, result.x);
+    }
+
+    #[test]
+    fn test_shgo_sphere_sobol_hnsw() {
+        let bounds = vec![(-5.0, 5.0), (-5.0, 5.0)];
+        let options = ShgoOptions {
+            maxiter: Some(2),
+            sampling_method: SamplingMethod::Sobol,
+            connectivity_method: ConnectivityMethod::HNSW,
+            n: 64,
+            disp: 0,
+            ..Default::default()
+        };
+
+        let result = Shgo::new(sphere, bounds)
+            .with_options(options)
+            .minimize()
+            .unwrap();
+
+        assert!(result.fun < 1.0, "HNSW should find near-optimal: fun={}", result.fun);
+        println!("Sphere (Sobol+HNSW) result: x={:?}, fun={}", result.x, result.fun);
+    }
+
+    #[test]
+    fn test_shgo_rosenbrock_sobol_hnsw() {
+        let bounds = vec![(-2.0, 2.0), (-2.0, 2.0)];
+        let options = ShgoOptions {
+            maxiter: Some(3),
+            sampling_method: SamplingMethod::Sobol,
+            connectivity_method: ConnectivityMethod::HNSW,
+            n: 128,
+            disp: 0,
+            ..Default::default()
+        };
+
+        let result = Shgo::new(rosenbrock, bounds)
+            .with_options(options)
+            .minimize()
+            .unwrap();
+
+        assert!(result.fun < 1.0, "HNSW Rosenbrock should converge: fun={}", result.fun);
+        println!("Rosenbrock (Sobol+HNSW) result: x={:?}, fun={}", result.x, result.fun);
+    }
+
+    #[test]
+    fn test_shgo_rastrigin_5d_hnsw() {
+        let rastrigin = |x: &[f64]| -> f64 {
+            let n = x.len() as f64;
+            10.0 * n + x.iter().map(|&xi| xi * xi - 10.0 * (2.0 * std::f64::consts::PI * xi).cos()).sum::<f64>()
+        };
+        let bounds = vec![(-5.12, 5.12); 5];
+        let options = ShgoOptions {
+            maxiter: Some(2),
+            sampling_method: SamplingMethod::Sobol,
+            connectivity_method: ConnectivityMethod::HNSW,
+            n: 256,
+            disp: 0,
+            ..Default::default()
+        };
+
+        let result = Shgo::new(rastrigin, bounds)
+            .with_options(options)
+            .minimize()
+            .unwrap();
+
+        assert!(result.nfev > 0);
+        println!("Rastrigin 5D (HNSW) result: fun={}, x={:?}", result.fun, result.x);
+    }
+
+    #[test]
+    fn test_shgo_sphere_sobol_scann() {
+        let bounds = vec![(-5.0, 5.0), (-5.0, 5.0)];
+        let options = ShgoOptions {
+            maxiter: Some(2),
+            sampling_method: SamplingMethod::Sobol,
+            connectivity_method: ConnectivityMethod::ScaNN,
+            n: 64,
+            disp: 0,
+            ..Default::default()
+        };
+
+        let result = Shgo::new(sphere, bounds)
+            .with_options(options)
+            .minimize()
+            .unwrap();
+
+        assert!(result.fun < 1.0, "ScaNN should find near-optimal: fun={}", result.fun);
+        println!("Sphere (Sobol+ScaNN) result: x={:?}, fun={}", result.x, result.fun);
+    }
+
+    #[test]
+    fn test_shgo_rosenbrock_sobol_scann() {
+        let bounds = vec![(-2.0, 2.0), (-2.0, 2.0)];
+        let options = ShgoOptions {
+            maxiter: Some(3),
+            sampling_method: SamplingMethod::Sobol,
+            connectivity_method: ConnectivityMethod::ScaNN,
+            n: 128,
+            disp: 0,
+            ..Default::default()
+        };
+
+        let result = Shgo::new(rosenbrock, bounds)
+            .with_options(options)
+            .minimize()
+            .unwrap();
+
+        assert!(result.fun < 1.0, "ScaNN Rosenbrock should converge: fun={}", result.fun);
+        println!("Rosenbrock (Sobol+ScaNN) result: x={:?}, fun={}", result.x, result.fun);
+    }
+
+    #[test]
+    fn test_shgo_rastrigin_5d_scann() {
+        let rastrigin = |x: &[f64]| -> f64 {
+            let n = x.len() as f64;
+            10.0 * n + x.iter().map(|&xi| xi * xi - 10.0 * (2.0 * std::f64::consts::PI * xi).cos()).sum::<f64>()
+        };
+        let bounds = vec![(-5.12, 5.12); 5];
+        let options = ShgoOptions {
+            maxiter: Some(2),
+            sampling_method: SamplingMethod::Sobol,
+            connectivity_method: ConnectivityMethod::ScaNN,
+            n: 256,
+            disp: 0,
+            ..Default::default()
+        };
+
+        let result = Shgo::new(rastrigin, bounds)
+            .with_options(options)
+            .minimize()
+            .unwrap();
+
+        assert!(result.nfev > 0);
+        println!("Rastrigin 5D (ScaNN) result: fun={}, x={:?}", result.fun, result.x);
     }
 
     #[test]

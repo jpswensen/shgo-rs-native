@@ -43,13 +43,16 @@ pub mod shgo;
 pub mod local_opt;
 pub mod ffi;
 
+#[cfg(feature = "track-alloc")]
+pub mod alloc_tracker;
+
 // Re-export main types
 pub use coordinates::Coordinates;
 pub use vertex::{Vertex, VertexCache};
 pub use complex::Complex;
 pub use sobol::Sobol;
 pub use error::{ShgoError, Result as ShgoResult};
-pub use shgo::{Shgo, ShgoOptions, ShgoResult as OptimizeResult, SamplingMethod, Bounds, LMapCache, LocalMinimum};
+pub use shgo::{Shgo, ShgoOptions, ShgoResult as OptimizeResult, SamplingMethod, ConnectivityMethod, Bounds, LMapCache, LocalMinimum};
 pub use local_opt::{LocalOptimizer, LocalOptimizerOptions, LocalOptResult, minimize_local};
 
 /// Prelude module for convenient imports

@@ -32,7 +32,7 @@
 //! ```
 
 use std::collections::HashSet;
-use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicU8, AtomicUsize, Ordering};
 use std::sync::Arc;
 
 use indexmap::IndexMap;
@@ -40,6 +40,12 @@ use parking_lot::RwLock;
 use rayon::prelude::*;
 
 use crate::coordinates::Coordinates;
+
+/// Cached min/max status encoded as AtomicU8:
+/// 0 = needs recheck, 1 = not a minimizer/maximizer, 2 = is a minimizer/maximizer
+const CACHE_NEEDS_RECHECK: u8 = 0;
+const CACHE_FALSE: u8 = 1;
+const CACHE_TRUE: u8 = 2;
 
 /// A vertex in the simplicial complex.
 ///
@@ -53,7 +59,7 @@ use crate::coordinates::Coordinates;
 /// # Thread Safety
 ///
 /// Vertex fields that may be modified use interior mutability via [`RwLock`].
-/// The `check_min` and `check_max` flags use [`AtomicBool`] for lock-free access.
+/// The cached extrema fields use [`AtomicU8`] for lock-free access.
 ///
 /// # Example
 ///
@@ -83,17 +89,11 @@ pub struct Vertex {
     /// `None` if not yet checked.
     feasible: RwLock<Option<bool>>,
 
-    /// Flag indicating that minimizer status needs to be recomputed.
-    check_min: AtomicBool,
+    /// Cached minimizer status: 0=needs_recheck, 1=not_minimizer, 2=is_minimizer.
+    cached_min: AtomicU8,
 
-    /// Flag indicating that maximizer status needs to be recomputed.
-    check_max: AtomicBool,
-
-    /// Cached minimizer status (valid only when check_min is false).
-    cached_min: RwLock<Option<bool>>,
-
-    /// Cached maximizer status (valid only when check_max is false).
-    cached_max: RwLock<Option<bool>>,
+    /// Cached maximizer status: 0=needs_recheck, 1=not_maximizer, 2=is_maximizer.
+    cached_max: AtomicU8,
 }
 
 impl Vertex {
@@ -120,10 +120,8 @@ impl Vertex {
             neighbors: RwLock::new(HashSet::new()),
             f: RwLock::new(None),
             feasible: RwLock::new(None),
-            check_min: AtomicBool::new(true),
-            check_max: AtomicBool::new(true),
-            cached_min: RwLock::new(None),
-            cached_max: RwLock::new(None),
+            cached_min: AtomicU8::new(CACHE_NEEDS_RECHECK),
+            cached_max: AtomicU8::new(CACHE_NEEDS_RECHECK),
         }
     }
 
@@ -135,10 +133,8 @@ impl Vertex {
             neighbors: RwLock::new(HashSet::new()),
             f: RwLock::new(None),
             feasible: RwLock::new(None),
-            check_min: AtomicBool::new(true),
-            check_max: AtomicBool::new(true),
-            cached_min: RwLock::new(None),
-            cached_max: RwLock::new(None),
+            cached_min: AtomicU8::new(CACHE_NEEDS_RECHECK),
+            cached_max: AtomicU8::new(CACHE_NEEDS_RECHECK),
         }
     }
 
@@ -220,8 +216,8 @@ impl Vertex {
         let mut neighbors = self.neighbors.write();
         if neighbors.insert(other_index) {
             // Connection added, invalidate cached status
-            self.check_min.store(true, Ordering::Release);
-            self.check_max.store(true, Ordering::Release);
+            self.cached_min.store(CACHE_NEEDS_RECHECK, Ordering::Release);
+            self.cached_max.store(CACHE_NEEDS_RECHECK, Ordering::Release);
         }
     }
 
@@ -232,8 +228,8 @@ impl Vertex {
         let mut neighbors = self.neighbors.write();
         if neighbors.remove(&other_index) {
             // Connection removed, invalidate cached status
-            self.check_min.store(true, Ordering::Release);
-            self.check_max.store(true, Ordering::Release);
+            self.cached_min.store(CACHE_NEEDS_RECHECK, Ordering::Release);
+            self.cached_max.store(CACHE_NEEDS_RECHECK, Ordering::Release);
         }
     }
 
@@ -253,48 +249,52 @@ impl Vertex {
 
     /// Mark that minimizer/maximizer status needs recomputation.
     pub fn invalidate_extrema_cache(&self) {
-        self.check_min.store(true, Ordering::Release);
-        self.check_max.store(true, Ordering::Release);
+        self.cached_min.store(CACHE_NEEDS_RECHECK, Ordering::Release);
+        self.cached_max.store(CACHE_NEEDS_RECHECK, Ordering::Release);
     }
 
     /// Check if the minimizer status needs recomputation.
     pub fn needs_min_check(&self) -> bool {
-        self.check_min.load(Ordering::Acquire)
+        self.cached_min.load(Ordering::Acquire) == CACHE_NEEDS_RECHECK
     }
 
     /// Check if the maximizer status needs recomputation.
     pub fn needs_max_check(&self) -> bool {
-        self.check_max.load(Ordering::Acquire)
+        self.cached_max.load(Ordering::Acquire) == CACHE_NEEDS_RECHECK
     }
 
     /// Get the cached minimizer status without recomputing.
     pub fn cached_minimizer(&self) -> Option<bool> {
-        if self.check_min.load(Ordering::Acquire) {
-            None
-        } else {
-            *self.cached_min.read()
+        match self.cached_min.load(Ordering::Acquire) {
+            CACHE_NEEDS_RECHECK => None,
+            CACHE_TRUE => Some(true),
+            _ => Some(false),
         }
     }
 
     /// Set the cached minimizer status.
     pub fn set_cached_minimizer(&self, is_min: bool) {
-        *self.cached_min.write() = Some(is_min);
-        self.check_min.store(false, Ordering::Release);
+        self.cached_min.store(
+            if is_min { CACHE_TRUE } else { CACHE_FALSE },
+            Ordering::Release,
+        );
     }
 
     /// Get the cached maximizer status without recomputing.
     pub fn cached_maximizer(&self) -> Option<bool> {
-        if self.check_max.load(Ordering::Acquire) {
-            None
-        } else {
-            *self.cached_max.read()
+        match self.cached_max.load(Ordering::Acquire) {
+            CACHE_NEEDS_RECHECK => None,
+            CACHE_TRUE => Some(true),
+            _ => Some(false),
         }
     }
 
     /// Set the cached maximizer status.
     pub fn set_cached_maximizer(&self, is_max: bool) {
-        *self.cached_max.write() = Some(is_max);
-        self.check_max.store(false, Ordering::Release);
+        self.cached_max.store(
+            if is_max { CACHE_TRUE } else { CACHE_FALSE },
+            Ordering::Release,
+        );
     }
 }
 
@@ -311,7 +311,7 @@ impl std::fmt::Debug for Vertex {
 }
 
 // Vertex is Send + Sync because all mutable fields use interior mutability
-// with thread-safe primitives (RwLock, AtomicBool)
+// with thread-safe primitives (RwLock, AtomicU8)
 unsafe impl Send for Vertex {}
 unsafe impl Sync for Vertex {}
 

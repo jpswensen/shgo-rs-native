@@ -40,6 +40,9 @@ sobol-qmc = "2.5"  # Joe-Kuo Sobol sequences (matching scipy's direction numbers
 
 # C FFI
 libc = "0.2"
+smallvec = "1.15.1"
+hnsw_rs = "0.3.4"
+vecstore = "1.0.0"
 
 [dev-dependencies]
 criterion = "0.8.2"  # Benchmarking
@@ -55,6 +58,7 @@ harness = false
 [features]
 default = []
 parallel = []  # Enable parallel processing features
+track-alloc = []  # Enable allocation tracking for memory profiling
 
 [profile.release]
 lto = "fat"
