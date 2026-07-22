@@ -51,6 +51,19 @@ linear scans during refinement (a hub vertex with ~26k neighbors, scanned O(V) p
 neighbor per sub-region) — which also explains why pre-fix runs pegged a single core.
 Test suite after all fixes: 100 unit + 10 cross-validation + 21 doctests, all passing.
 
+**P1 follow-up (same session, committed separately):** the brute-force KNN build is now
+rayon-parallel across rows (edge set unchanged — deterministic); the three ANN
+connectivity methods (KNN/HNSW/ScaNN) build over the **full cumulative point cloud**
+each iteration, matching SciPy's re-triangulate-everything semantics (Delaunay remains
+per-batch — the P2 item); and `maxev` now counts sampled points (SciPy's `n_sampled`),
+not feasible evaluations, with a discriminating unit test
+(`test_maxev_counts_sampled_points_not_fev`). Validation: Delaunay and simplicial paths
+stayed bitwise identical; KNN multi-iteration results changed in the intended direction
+(16384-point sphere drops a duplicate near-origin candidate, 2 → 1 minima and fewer
+wasted local evals; rastrigin cases surface additional distinct minima). Timing:
+Sobol+KNN sphere 6-D n=16384 ×2 iters: 2.55 s → **1.22 s** (3.6× vs original baseline).
+Suite: 101 unit + 10 cross-validation + 21 doctests green.
+
 ## 1. The KNN / connectivity work: exists on GitHub since April 2026
 
 Commit `157e8fd` ("Add 4 connectivity methods for Sobol mode + performance
@@ -187,8 +200,8 @@ returning it from the iterate functions or hoisting the cache).
 
 | # | Deviation | Where | Impact |
 |---|---|---|---|
-| 4.1 | `maxev` compares against function evaluations instead of sampled points | src/shgo.rs:1198–1201 | SciPy checks `n_sampled >= maxev` (sampling points incl. infeasible); Rust reuses `fev_count`, making `maxev` a duplicate of `maxfev`. Fix: track points generated / vertex-cache size. |
-| 4.2 | Sobol mode builds connectivity over only the new batch each iteration — **all four connectivity methods** | src/shgo.rs:995–1060 | SciPy accumulates all points in `self.C` and re/incrementally triangulates the whole cloud (`Tri.add_points`), so old vertices gain new neighbors and stale minimizers get disqualified. Rust leaves old vertices with stale neighborhoods and never connects old↔new; the new KNN/HNSW/ScaNN builders inherit the same per-batch scope. Single-iteration runs are unaffected; multi-iteration runs produce extra local-minimization candidates (LMC dedup keeps this cheap, but it deviates from SciPy). For KNN this is trivially fixable: build the graph over *all* cached vertices each iteration. |
+| 4.1 | ~~`maxev` compares against function evaluations instead of sampled points~~ **FIXED (2026-07-22)** | — | SciPy checks `n_sampled >= maxev` (sampling points incl. infeasible); Rust reuses `fev_count`, making `maxev` a duplicate of `maxfev`. Fix: track points generated / vertex-cache size. |
+| 4.2 | Sobol mode builds connectivity over only the new batch — **fixed for KNN/HNSW/ScaNN (2026-07-22); Delaunay still per-batch (P2)** | src/shgo.rs:995–1060 | SciPy accumulates all points in `self.C` and re/incrementally triangulates the whole cloud (`Tri.add_points`), so old vertices gain new neighbors and stale minimizers get disqualified. Rust leaves old vertices with stale neighborhoods and never connects old↔new; the new KNN/HNSW/ScaNN builders inherit the same per-batch scope. Single-iteration runs are unaffected; multi-iteration runs produce extra local-minimization candidates (LMC dedup keeps this cheap, but it deviates from SciPy). For KNN this is trivially fixable: build the graph over *all* cached vertices each iteration. |
 | 4.3 | Default simplicial iteration refines the whole complex | src/shgo.rs:766–772, src/complex.rs:410–444 | With default `n=0`, every iteration calls `refine_all` → super-exponential vertex growth (≈3^dim per generation). SciPy's default resolves `n = 2^dim + 1` and calls `refine(n)`, adding ~n targeted points per iteration (linear growth). Combined with 3.1 this is the other half of the scaling wall. |
 | 4.4 | `Complex::refine(Some(n))` overshoots; `cyclic_product_limited` ignores its limit | src/complex.rs:337–344, 410–425 | `refine(n)` loops `refine_all` until `len ≥ target` (can add thousands for n=5); the initial triangulation always builds all 2^dim corners regardless of `n` (1M vertices at dim=20 before refinement starts). SciPy's `Complex.triangulate(n)`/`refine(n)` are incremental and bounded. This makes simplicial mode unusable beyond dim ≈ 15 even for tiny n. |
 | 4.5 | One extra refinement generation in every simplicial run | src/shgo.rs:754–772 | Rust triangulates *before* the loop and refines *inside* iteration 1; SciPy's first iteration is the initial triangulation only. Default `iters=1` therefore samples ~3^dim points where SciPy samples 2^dim+1 — different nfev, different minimizer pool. The cross-validation suite doesn't catch it because there is no end-to-end fixture (see §7). |
@@ -312,9 +325,9 @@ Recommended additions, in order of value:
 | ~~P0~~ ✅ | 3.1 O(1) `get_by_index` + remove inline linear scans | done |
 | ~~P0~~ ✅ | 3.2 doctest imports (`shgo_rs` → `shgo`), full `cargo test` green | done |
 | ~~P0~~ ✅ | 3.3 FFI: constraints wired through + regression test | done |
-| P1 | 6. parallelize the brute-force KNN loop (rayon over rows) | ~1 h |
-| P1 | 6/4.2 build KNN graph over all cached vertices (cumulative), not per batch | ~2 h |
-| ~~P1~~ ✅/P1 | 3.4 nfev accounting done; 4.1 maxev semantics still open | ~30 min |
+| ~~P1~~ ✅ | 6. parallelize the brute-force KNN loop (rayon over rows) | done |
+| ~~P1~~ ✅ | 6/4.2 build ANN graphs over all cached vertices (cumulative) | done |
+| ~~P1~~ ✅ | 3.4 nfev accounting; 4.1 maxev semantics | done |
 | P1 | 4.3/4.4/4.5 simplicial growth control (`refine(n)` bounded, no extra generation) | ~1 day |
 | P2 | 4.2 cumulative/incremental Delaunay per iteration | ~0.5 day |
 | P2 | 4.6 sort pool before `maxiter_local`; 4.7 success semantics; 4.8 delete dead options | ~2 h |

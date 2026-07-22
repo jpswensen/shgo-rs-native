@@ -60,9 +60,11 @@ dispatches on `SamplingMethod`:
   first two indices of each dim-combination), `KNearestNeighbors` (serial brute-force
   O(n²·d), bidirectional), `HNSW` (`hnsw_rs`, approximate), or `ScaNN` (`vecstore`,
   f32-quantized, falls back to KNN on failure). k defaults to `2·dim + 1`, overridable
-  via `knn_neighbors`. All methods build the graph over the **current batch only** —
-  prior iterations' vertices keep their old neighborhoods (a known deviation from SciPy's
-  cumulative re-triangulation). Local minimization uses global bounds (matches SciPy's
+  via `knn_neighbors`. The three ANN methods build the graph over the **full cumulative
+  point cloud** each iteration (matching SciPy's re-triangulation semantics; the KNN
+  build is rayon-parallel); Delaunay still covers only the current batch, so its
+  prior-iteration vertices keep stale neighborhoods (known deviation, P2 in the audit).
+  Local minimization uses global bounds (matches SciPy's
   `construct_lcb_delaunay`). Each iteration continues the Sobol sequence
   (`skip = sobol_skip + total_points`) and re-inserts previously found minima as points.
 

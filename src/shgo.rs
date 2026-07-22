@@ -862,7 +862,7 @@ where
             }
 
             // Check stopping criteria AFTER work (matching Python)
-            if self.check_stopping_criteria(iteration, effective_iters, start_time.elapsed(), result)? {
+            if self.check_stopping_criteria(iteration, effective_iters, start_time.elapsed(), result, complex.vertex_count())? {
                 break;
             }
         }
@@ -1017,12 +1017,36 @@ where
                             &vertices_in_order[w[1]],
                         );
                     }
+                } else if self.options.connectivity_method == ConnectivityMethod::Delaunay {
+                    // Delaunay keeps per-batch scope for now (cumulative /
+                    // incremental triangulation is tracked separately —
+                    // see shgo_fable_recommendations.md §4.2).
+                    Self::build_delaunay_connectivity(
+                        &points,
+                        &vertices_in_order,
+                        self.dim,
+                        self.options.disp,
+                    )?;
                 } else {
+                    // ANN methods build the graph over the FULL cumulative
+                    // point cloud, matching SciPy's semantics of
+                    // re-triangulating all sampled points each iteration.
+                    // Per-batch graphs would leave earlier iterations'
+                    // vertices with stale neighborhoods and no old↔new
+                    // edges. On iteration 1 the cache equals the batch, so
+                    // this is identical to per-batch there. The cache is
+                    // deduplicated by construction, so re-inserted minima
+                    // coinciding with sample points cost nothing extra.
+                    let all_vertices: Vec<std::sync::Arc<crate::Vertex>> =
+                        cache.iter().collect();
+                    let all_points: Vec<Vec<f64>> =
+                        all_vertices.iter().map(|v| v.x().to_vec()).collect();
+
                     match self.options.connectivity_method {
                         ConnectivityMethod::KNearestNeighbors => {
                             Self::build_knn_connectivity(
-                                &points,
-                                &vertices_in_order,
+                                &all_points,
+                                &all_vertices,
                                 self.dim,
                                 self.options.knn_neighbors,
                                 self.options.disp,
@@ -1030,8 +1054,8 @@ where
                         }
                         ConnectivityMethod::HNSW => {
                             Self::build_hnsw_connectivity(
-                                &points,
-                                &vertices_in_order,
+                                &all_points,
+                                &all_vertices,
                                 self.dim,
                                 self.options.knn_neighbors,
                                 self.options.disp,
@@ -1039,21 +1063,14 @@ where
                         }
                         ConnectivityMethod::ScaNN => {
                             Self::build_scann_connectivity(
-                                &points,
-                                &vertices_in_order,
+                                &all_points,
+                                &all_vertices,
                                 self.dim,
                                 self.options.knn_neighbors,
                                 self.options.disp,
                             );
                         }
-                        ConnectivityMethod::Delaunay => {
-                            Self::build_delaunay_connectivity(
-                                &points,
-                                &vertices_in_order,
-                                self.dim,
-                                self.options.disp,
-                            )?;
-                        }
+                        ConnectivityMethod::Delaunay => unreachable!(),
                     }
                 }
             }
@@ -1123,7 +1140,7 @@ where
             }
 
             // Check stopping criteria AFTER work (matching Python)
-            if self.check_stopping_criteria(iteration, effective_iters, start_time.elapsed(), result)? {
+            if self.check_stopping_criteria(iteration, effective_iters, start_time.elapsed(), result, total_points)? {
                 break;
             }
         }
@@ -1173,6 +1190,7 @@ where
         effective_iters: Option<usize>,
         elapsed: Duration,
         result: &ShgoResult,
+        n_sampled: usize,
     ) -> Result<bool, ShgoError> {
         // Check cancellation
         if self.is_cancelled() {
@@ -1200,9 +1218,12 @@ where
             }
         }
 
-        // Check sampling evaluation limit (maxev)
+        // Check sampling evaluation limit (maxev): counts sampled points
+        // including infeasible ones, matching SciPy's
+        // `self.n_sampled >= self.maxev` (distinct from maxfev, which counts
+        // feasible objective evaluations).
         if let Some(maxev) = self.options.maxev {
-            if self.fev_count() >= maxev {
+            if n_sampled >= maxev {
                 return Ok(true);
             }
         }
@@ -1257,8 +1278,11 @@ where
 
         // Brute-force k-NN: compute all pairwise squared distances,
         // then partial-sort each row to find the k nearest.
-        // This is O(n² · d) which is fast for n ≤ ~4096, d ≤ ~20.
-        for i in 0..n {
+        // O(n² · d) total, parallelized across rows with rayon. Each row's
+        // k-selection depends only on its own distance computation (not on
+        // thread scheduling), and neighbors are a set, so the resulting edge
+        // set — and therefore the optimization result — is deterministic.
+        (0..n).into_par_iter().for_each(|i| {
             // Compute squared distances from point i to all other points
             let mut dists: Vec<(usize, f64)> = (0..n)
                 .filter(|&j| j != i)
@@ -1280,11 +1304,11 @@ where
                 dists.truncate(k);
             }
 
-            // Connect bidirectionally
+            // Connect bidirectionally (Vertex::connect is thread-safe)
             for &(j, _) in &dists {
                 crate::Vertex::connect_bidirectional(&vertices[i], &vertices[j]);
             }
-        }
+        });
 
         if disp > 1 {
             let avg_neighbors: f64 = vertices.iter()
@@ -2233,6 +2257,32 @@ mod tests {
 
         // Verify the optimizer stopped (didn't run all 100 iterations)
         assert!(result.nit < 100);
+    }
+
+    #[test]
+    fn test_maxev_counts_sampled_points_not_fev() {
+        // maxev limits SAMPLED points (including infeasible ones), matching
+        // SciPy's `n_sampled >= maxev` — not feasible objective evaluations.
+        // The constraint makes half the domain infeasible, so feasible evals
+        // (~32 after iteration 1) lag well behind sampled points (64).
+        let bounds = vec![(-5.0, 5.0), (-5.0, 5.0)];
+        let constraint = |x: &[f64]| x[0]; // feasible only when x[0] >= 0
+        let options = ShgoOptions {
+            sampling_method: SamplingMethod::Sobol,
+            n: 64,
+            maxev: Some(60),
+            maxiter: Some(100),
+            ..Default::default()
+        };
+
+        let result = Shgo::with_constraints(sphere, bounds, vec![constraint])
+            .with_options(options)
+            .minimize()
+            .unwrap();
+
+        // 64 points sampled in iteration 1 >= maxev = 60 → stop immediately.
+        // (The old bug compared feasible evals (~32) and ran a 2nd iteration.)
+        assert_eq!(result.nit, 1);
     }
 
     #[test]
