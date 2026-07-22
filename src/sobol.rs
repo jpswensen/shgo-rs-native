@@ -20,7 +20,7 @@
 //! # Example
 //!
 //! ```
-//! use shgo_rs::Sobol;
+//! use shgo::Sobol;
 //!
 //! let mut sobol = Sobol::new(2);
 //! let points = sobol.generate(10, 1);
@@ -123,7 +123,7 @@ impl Sobol {
     /// # Example
     ///
     /// ```
-    /// use shgo_rs::Sobol;
+    /// use shgo::Sobol;
     ///
     /// let mut sobol = Sobol::new(2);
     /// let point = sobol.next();
@@ -150,7 +150,7 @@ impl Sobol {
     /// # Example
     ///
     /// ```
-    /// use shgo_rs::Sobol;
+    /// use shgo::Sobol;
     ///
     /// let mut sobol = Sobol::new(2);
     /// let points = sobol.generate(100, 1);
@@ -181,7 +181,7 @@ impl Sobol {
     /// # Example
     ///
     /// ```
-    /// use shgo_rs::Sobol;
+    /// use shgo::Sobol;
     ///
     /// let mut sobol = Sobol::new(2);
     /// let bounds = vec![(-1.0, 1.0), (0.0, 10.0)];

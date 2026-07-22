@@ -6,6 +6,7 @@
 use std::ffi::c_void;
 use std::ptr;
 use std::slice;
+use std::sync::Arc;
 
 use crate::shgo::{Shgo, ShgoOptions, SamplingMethod};
 use crate::local_opt::LocalOptimizer;
@@ -195,7 +196,8 @@ pub struct ShgoResult_C {
 struct ShgoHandle {
     objective: Box<dyn Fn(&[f64]) -> f64 + Send + Sync>,
     bounds: Vec<(f64, f64)>,
-    constraints: Vec<Box<dyn Fn(&[f64]) -> f64 + Send + Sync>>,
+    /// Arc so `shgo_minimize` can hand owned clones to `Shgo::with_constraints`.
+    constraints: Vec<Arc<dyn Fn(&[f64]) -> f64 + Send + Sync>>,
     options: ShgoOptions,
     dim: usize,
 }
@@ -362,8 +364,8 @@ pub unsafe extern "C" fn shgo_add_constraint(
         unsafe { constraint_fn(x.as_ptr(), x.len(), user_data) }
     };
 
-    handle.constraints.push(Box::new(wrapped_constraint));
-    
+    handle.constraints.push(Arc::new(wrapped_constraint));
+
     ShgoStatus::Success
 }
 
@@ -397,13 +399,27 @@ pub unsafe extern "C" fn shgo_minimize(
         objective_ref(x)
     };
 
-    // Run optimization - constraints not directly supported in this API version
-    // For now we run without constraints (constraints need special handling in SHGO)
-    let shgo = Shgo::new(objective_wrapper, handle.bounds.clone())
-        .with_options(handle.options.clone());
+    // Run optimization, passing through any constraints registered via
+    // shgo_add_constraint (scipy g(x) >= 0 convention, matching the Rust API).
+    let run = if handle.constraints.is_empty() {
+        Shgo::new(objective_wrapper, handle.bounds.clone())
+            .with_options(handle.options.clone())
+            .minimize()
+    } else {
+        let constraints: Vec<_> = handle
+            .constraints
+            .iter()
+            .map(|c| {
+                let c = Arc::clone(c);
+                move |x: &[f64]| -> f64 { c(x) }
+            })
+            .collect();
+        Shgo::with_constraints(objective_wrapper, handle.bounds.clone(), constraints)
+            .with_options(handle.options.clone())
+            .minimize()
+    };
 
-    // Run optimization
-    let opt_result = match shgo.minimize() {
+    let opt_result = match run {
         Ok(r) => r,
         Err(_) => return ShgoStatus::OptimizationFailed,
     };
@@ -626,6 +642,54 @@ mod tests {
             assert_eq!(result.dim, 2);
 
             // Clean up
+            shgo_free_result(&mut result);
+            shgo_free(handle);
+        }
+    }
+
+    unsafe extern "C" fn sum_ge2_c(x: *const f64, dim: usize, _user_data: *mut c_void) -> f64 {
+        let slice = slice::from_raw_parts(x, dim);
+        slice[0] + slice[1] - 2.0 // >= 0 when x0 + x1 >= 2
+    }
+
+    #[test]
+    fn test_c_api_constraint_respected() {
+        unsafe {
+            let lower = [0.0_f64, 0.0];
+            let upper = [3.0_f64, 3.0];
+
+            let handle = shgo_create(
+                Some(sphere_c),
+                ptr::null_mut(),
+                lower.as_ptr(),
+                upper.as_ptr(),
+                2,
+            );
+            assert!(!handle.is_null());
+
+            let status = shgo_add_constraint(handle, Some(sum_ge2_c), ptr::null_mut());
+            assert_eq!(status, ShgoStatus::Success);
+
+            let mut options = shgo_options_default();
+            options.maxiter = 3;
+            let status = shgo_set_options(handle, &options);
+            assert_eq!(status, ShgoStatus::Success);
+
+            let mut result = std::mem::zeroed::<ShgoResult_C>();
+            let status = shgo_minimize(handle, &mut result);
+            assert_eq!(status, ShgoStatus::Success);
+
+            // Constrained minimum of the sphere subject to x0 + x1 >= 2 is
+            // (1, 1) with f = 2. If constraints were silently dropped, the
+            // optimizer would return (0, 0) with f = 0.
+            assert!(
+                (result.fun - 2.0).abs() < 1e-3,
+                "constraint not honored: fun = {}",
+                result.fun
+            );
+            assert!((*result.x.add(0) - 1.0).abs() < 1e-2);
+            assert!((*result.x.add(1) - 1.0).abs() < 1e-2);
+
             shgo_free_result(&mut result);
             shgo_free(handle);
         }

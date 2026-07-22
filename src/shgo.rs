@@ -9,7 +9,7 @@
 //! # Example
 //!
 //! ```
-//! use shgo_rs::{Shgo, ShgoOptions, Bounds};
+//! use shgo::{Shgo, ShgoOptions, Bounds};
 //!
 //! // Rosenbrock function
 //! let rosenbrock = |x: &[f64]| -> f64 {
@@ -449,7 +449,7 @@ where
     /// # Example
     ///
     /// ```
-    /// use shgo_rs::Shgo;
+    /// use shgo::Shgo;
     ///
     /// let sphere = |x: &[f64]| x.iter().map(|xi| xi.powi(2)).sum::<f64>();
     /// let bounds = vec![(-5.0, 5.0), (-5.0, 5.0)];
@@ -501,7 +501,7 @@ where
     /// # Example
     ///
     /// ```
-    /// use shgo_rs::Shgo;
+    /// use shgo::Shgo;
     ///
     /// let objective = |x: &[f64]| x[0].powi(2) + x[1].powi(2);
     /// let constraint = |x: &[f64]| x[0] + x[1] - 1.0; // x[0] + x[1] >= 1
@@ -632,7 +632,9 @@ where
         }
 
         // Finalize result
-        result.nfev = self.fev_count.load(Ordering::Relaxed);
+        // Total function evaluations = sampling evaluations + local-minimization
+        // evaluations, matching SciPy's `res.nfev = self.fn + self.res.nlfev`.
+        result.nfev = self.fev_count.load(Ordering::Relaxed) + result.nlfev;
         result.time = start_time.elapsed().as_secs_f64();
 
         // Sort and deduplicate local minima by function value
@@ -823,10 +825,11 @@ where
                         .collect();
 
                     // Gather successful results (order-independent: results are
-                    // deterministic per starting point via lmap_cache dedup)
+                    // deterministic per starting point via lmap_cache dedup).
+                    // nlfev is taken from lmap_cache.total_fev() after the loop
+                    // so failed attempts count too (matching SciPy's LMC).
                     for local_min in local_results.into_iter().flatten() {
                         if local_min.success {
-                            result.nlfev += local_min.nfev;
                             result.xl.push(local_min.x);
                             result.funl.push(local_min.fun);
                         }
@@ -864,8 +867,9 @@ where
             }
         }
 
-        // Add function evaluations from local minimizations
-        result.nfev += lmap_cache.total_fev();
+        // Local-minimization function evaluations across all attempts
+        // (successful or not), matching SciPy's `res.nlfev`.
+        result.nlfev = lmap_cache.total_fev();
 
         // If no local minimizer was found, find the lowest sampled vertex
         // and lowest LMC entry (matching Python's find_lowest_vertex)
@@ -1083,11 +1087,12 @@ where
                     })
                     .collect();
 
+                // nlfev is taken from lmap_cache.total_fev() after the loop
+                // so failed attempts count too (matching SciPy's LMC).
                 for local_min in local_results.into_iter().flatten() {
                     if local_min.success {
                         result.xl.push(local_min.x);
                         result.funl.push(local_min.fun);
-                        result.nlfev += local_min.nfev;
                     }
                 }
             } else {
@@ -1123,8 +1128,9 @@ where
             }
         }
 
-        // Add function evaluations from local minimizations
-        result.nfev += lmap_cache.total_fev();
+        // Local-minimization function evaluations across all attempts
+        // (successful or not), matching SciPy's `res.nlfev`.
+        result.nlfev = lmap_cache.total_fev();
 
         // If no local minimizer was found, find the lowest sampled vertex
         // and lowest LMC entry (matching Python's find_lowest_vertex)
@@ -2162,13 +2168,16 @@ mod tests {
         };
 
         let shgo = Shgo::new(sphere, bounds).with_options(options);
-        
+
         assert_eq!(shgo.fev_count(), 0);
-        
+
         let result = shgo.minimize().unwrap();
-        
+
         assert!(result.nfev > 0);
-        assert_eq!(result.nfev, shgo.fev_count());
+        // nfev = sampling evaluations + local-minimization evaluations
+        // (matching SciPy's res.nfev = fn + nlfev).
+        assert_eq!(result.nfev, shgo.fev_count() + result.nlfev);
+        assert!(result.nlfev > 0);
     }
 
     #[test]

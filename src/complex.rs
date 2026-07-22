@@ -16,7 +16,7 @@
 //! # Example
 //!
 //! ```
-//! use shgo_rs::Complex;
+//! use shgo::Complex;
 //!
 //! // Create a 2D complex over the unit square
 //! let bounds = vec![(0.0, 1.0), (0.0, 1.0)];
@@ -98,7 +98,7 @@ where
     /// # Example
     ///
     /// ```
-    /// use shgo_rs::Complex;
+    /// use shgo::Complex;
     ///
     /// let bounds = vec![(0.0, 1.0), (0.0, 1.0)];
     /// let f = |x: &[f64]| x[0].powi(2) + x[1].powi(2);
@@ -177,7 +177,7 @@ where
     /// # Example
     ///
     /// ```
-    /// use shgo_rs::Complex;
+    /// use shgo::Complex;
     ///
     /// let bounds = vec![(0.0, 1.0), (0.0, 1.0)];
     /// let f = |x: &[f64]| x[0] + x[1];

@@ -64,7 +64,7 @@ const CACHE_TRUE: u8 = 2;
 /// # Example
 ///
 /// ```
-/// use shgo_rs::Vertex;
+/// use shgo::Vertex;
 ///
 /// let v = Vertex::new(vec![0.5, 0.5], 0);
 /// assert_eq!(v.index(), 0);
@@ -107,7 +107,7 @@ impl Vertex {
     /// # Example
     ///
     /// ```
-    /// use shgo_rs::Vertex;
+    /// use shgo::Vertex;
     ///
     /// let v = Vertex::new(vec![1.0, 2.0, 3.0], 42);
     /// assert_eq!(v.index(), 42);
@@ -443,6 +443,11 @@ where
         let index = self.next_index.fetch_add(1, Ordering::SeqCst);
         let vertex = Arc::new(Vertex::new(coords, index));
         cache.insert(key, vertex.clone());
+        // Invariant: a vertex's index equals its insertion position in the
+        // IndexMap (index is assigned under this same write lock and vertices
+        // are never removed). get_by_index & friends rely on this for O(1)
+        // positional lookup — any future pruning/removal breaks it.
+        debug_assert_eq!(cache.len() - 1, index);
 
         // Add to pending pools
         self.pending_field.write().push(index);
@@ -464,9 +469,10 @@ where
 
     /// Get a vertex by its index.
     ///
-    /// This is O(n) as it must search all vertices.
+    /// O(1): a vertex's index equals its insertion position in the cache
+    /// (see the invariant note in `get_or_create`).
     pub fn get_by_index(&self, index: usize) -> Option<Arc<Vertex>> {
-        self.cache.read().values().find(|v| v.index() == index).cloned()
+        self.cache.read().get_index(index).map(|(_, v)| v.clone())
     }
 
     /// Iterate over all vertices in the cache.
@@ -496,9 +502,7 @@ where
         // Build a vec of (vertex, coords) for parallel processing
         let vertices: Vec<_> = pending
             .iter()
-            .filter_map(|&idx| {
-                cache.values().find(|v| v.index() == idx).cloned()
-            })
+            .filter_map(|&idx| cache.get_index(idx).map(|(_, v)| v.clone()))
             .collect();
 
         // Process constraints in parallel
@@ -527,9 +531,7 @@ where
         // Build vec of vertices to evaluate
         let vertices: Vec<_> = pending
             .iter()
-            .filter_map(|&idx| {
-                cache.values().find(|v| v.index() == idx).cloned()
-            })
+            .filter_map(|&idx| cache.get_index(idx).map(|(_, v)| v.clone()))
             .collect();
 
         // Process field evaluations in parallel
@@ -598,7 +600,7 @@ where
         let cache = self.cache.read();
 
         let is_min = neighbor_indices.iter().all(|&nn_idx| {
-            if let Some(nn) = cache.values().find(|v| v.index() == nn_idx) {
+            if let Some((_, nn)) = cache.get_index(nn_idx) {
                 match nn.f() {
                     Some(nn_f) => f < nn_f,
                     None => true, // Unevaluated neighbor doesn't disqualify
@@ -630,7 +632,7 @@ where
         let cache = self.cache.read();
 
         let is_max = neighbor_indices.iter().all(|&nn_idx| {
-            if let Some(nn) = cache.values().find(|v| v.index() == nn_idx) {
+            if let Some((_, nn)) = cache.get_index(nn_idx) {
                 match nn.f() {
                     Some(nn_f) => f > nn_f,
                     None => true,

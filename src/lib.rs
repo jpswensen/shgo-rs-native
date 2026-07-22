@@ -13,7 +13,7 @@
 //! ## Example
 //!
 //! ```rust
-//! use shgo_rs::{Shgo, ShgoOptions, Bounds};
+//! use shgo::{Shgo, ShgoOptions, Bounds};
 //!
 //! // Rosenbrock function
 //! let objective = |x: &[f64]| {

@@ -23,7 +23,7 @@ use smallvec::SmallVec;
 /// # Example
 ///
 /// ```
-/// use shgo_rs::Coordinates;
+/// use shgo::Coordinates;
 ///
 /// let coords = Coordinates::new(vec![0.5, 1.0, -0.25]);
 /// assert_eq!(coords.dim(), 3);
@@ -47,7 +47,7 @@ impl Coordinates {
     /// # Example
     ///
     /// ```
-    /// use shgo_rs::Coordinates;
+    /// use shgo::Coordinates;
     ///
     /// let coords = Coordinates::new(vec![1.0, 2.0, 3.0]);
     /// assert_eq!(coords.dim(), 3);
@@ -63,7 +63,7 @@ impl Coordinates {
     /// # Example
     ///
     /// ```
-    /// use shgo_rs::Coordinates;
+    /// use shgo::Coordinates;
     ///
     /// let arr = [1.0, 2.0, 3.0];
     /// let coords = Coordinates::from_slice(&arr);
@@ -77,7 +77,7 @@ impl Coordinates {
     /// # Example
     ///
     /// ```
-    /// use shgo_rs::Coordinates;
+    /// use shgo::Coordinates;
     ///
     /// let origin = Coordinates::zeros(3);
     /// assert_eq!(origin.as_slice(), &[0.0, 0.0, 0.0]);
@@ -91,7 +91,7 @@ impl Coordinates {
     /// # Example
     ///
     /// ```
-    /// use shgo_rs::Coordinates;
+    /// use shgo::Coordinates;
     ///
     /// let ones = Coordinates::filled(3, 1.0);
     /// assert_eq!(ones.as_slice(), &[1.0, 1.0, 1.0]);
@@ -156,7 +156,7 @@ impl Coordinates {
     /// # Example
     ///
     /// ```
-    /// use shgo_rs::Coordinates;
+    /// use shgo::Coordinates;
     ///
     /// let a = Coordinates::new(vec![0.0, 0.0]);
     /// let b = Coordinates::new(vec![2.0, 4.0]);
@@ -217,7 +217,7 @@ impl Coordinates {
     /// # Example
     ///
     /// ```
-    /// use shgo_rs::Coordinates;
+    /// use shgo::Coordinates;
     ///
     /// let coords = Coordinates::new(vec![0.5, 0.5]);
     /// assert!(coords.in_bounds(&[(0.0, 1.0), (0.0, 1.0)]));

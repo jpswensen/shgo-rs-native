@@ -1,2 +1,6 @@
 /target
 *.json
+
+# macOS AppleDouble junk
+._*
+.DS_Store

@@ -27,7 +27,7 @@
 //! # Example
 //!
 //! ```
-//! use shgo_rs::local_opt::{LocalOptimizer, LocalOptimizerOptions, minimize_local};
+//! use shgo::local_opt::{LocalOptimizer, LocalOptimizerOptions, minimize_local};
 //!
 //! let sphere = |x: &[f64]| x.iter().map(|xi| xi.powi(2)).sum::<f64>();
 //! let bounds = vec![(-5.0, 5.0), (-5.0, 5.0)];
