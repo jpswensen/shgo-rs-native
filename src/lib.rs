@@ -52,7 +52,7 @@ pub use vertex::{Vertex, VertexCache};
 pub use complex::Complex;
 pub use sobol::Sobol;
 pub use error::{ShgoError, Result as ShgoResult};
-pub use shgo::{Shgo, ShgoOptions, ShgoResult as OptimizeResult, SamplingMethod, ConnectivityMethod, Bounds, LMapCache, LocalMinimum};
+pub use shgo::{BasinStats, Shgo, ShgoOptions, ShgoResult as OptimizeResult, SamplingMethod, ConnectivityMethod, Bounds, LMapCache, LocalMinimum};
 pub use local_opt::{LocalOptimizer, LocalOptimizerOptions, LocalOptResult, minimize_local};
 
 /// Prelude module for convenient imports

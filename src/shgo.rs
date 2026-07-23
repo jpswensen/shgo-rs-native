@@ -232,6 +232,20 @@ pub struct ShgoOptions {
     /// Set to KNearestNeighbors for faster high-dimensional problems.
     pub connectivity_method: ConnectivityMethod,
 
+    /// Compute per-basin statistics over the sampled vertex cloud after the
+    /// final iteration (graph-descent basin labeling + persistence sweep).
+    /// Costs O(V·k) arithmetic and zero objective evaluations. Extension —
+    /// SciPy SHGO has no equivalent. Default: false.
+    pub compute_basin_stats: bool,
+
+    /// Absolute cost thresholds for [`BasinStats::good_counts`]: for each
+    /// threshold t, the count of basin members with f <= t is reported.
+    pub basin_good_thresholds: Vec<f64>,
+
+    /// Fraction of worst member costs averaged into [`BasinStats::f_tail`]
+    /// (CVaR-style). Default: 0.1.
+    pub basin_tail_fraction: f64,
+
     /// Number of nearest neighbors for k-NN connectivity.
     /// Only used when connectivity_method is KNearestNeighbors.
     /// Default: None (auto: 2·dim + 1).
@@ -262,6 +276,9 @@ impl Default for ShgoOptions {
             workers: None,
             connectivity_method: ConnectivityMethod::Delaunay,
             knn_neighbors: None,
+            compute_basin_stats: false,
+            basin_good_thresholds: Vec::new(),
+            basin_tail_fraction: 0.1,
         }
     }
 }
@@ -279,6 +296,43 @@ pub struct LocalMinimum {
     pub nfev: usize,
     /// Number of iterations used.
     pub nit: usize,
+}
+
+/// Statistics for one basin of attraction of the sampled vertex cloud.
+///
+/// Basins are computed by steepest-descent labeling on the sampling graph:
+/// every finite-cost vertex is assigned to the graph minimizer its descent
+/// path terminates at. Because Sobol samples are uniform over the domain,
+/// `size` is an unbiased estimator of the basin's volume fraction
+/// (`size / total_sampled`). Sorted ascending by `f_min_sampled`.
+#[derive(Debug, Clone)]
+pub struct BasinStats {
+    /// Index into `xl`/`funl` of the polished local minimum this basin maps
+    /// to (None if the basin's graph minimizer was never polished, or its
+    /// polish is not retained in `xl`).
+    pub xl_index: Option<usize>,
+    /// Coordinates of the basin's lowest sampled vertex (the graph minimizer).
+    pub x_sampled: Vec<f64>,
+    /// Polished minimum from the local-minimization cache, if the graph
+    /// minimizer was used as a starting point.
+    pub x_polished: Option<Vec<f64>>,
+    /// Cost at the lowest sampled vertex (pre-polish).
+    pub f_min_sampled: f64,
+    /// Number of sampled vertices in this basin (uniform-sample volume proxy).
+    pub size: usize,
+    /// Mean member cost.
+    pub f_mean: f64,
+    /// Median member cost.
+    pub f_median: f64,
+    /// Mean of the worst `basin_tail_fraction` member costs (CVaR-style).
+    pub f_tail: f64,
+    /// Member counts at or below each `basin_good_thresholds` entry.
+    pub good_counts: Vec<usize>,
+    /// Persistence: cost at the saddle where this basin merges into an
+    /// older (lower) basin, minus `f_min_sampled`. `f64::INFINITY` for the
+    /// global basin. Basins with persistence below the objective's noise
+    /// level are likely sampling artifacts.
+    pub persistence: f64,
 }
 
 /// Result of SHGO optimization.
@@ -304,6 +358,9 @@ pub struct ShgoResult {
     pub nlfev: usize,
     /// Total optimization time in seconds.
     pub time: f64,
+    /// Per-basin statistics of the sampled cloud (only when
+    /// `ShgoOptions::compute_basin_stats` is set).
+    pub basins: Option<Vec<BasinStats>>,
 }
 
 impl ShgoResult {
@@ -320,6 +377,7 @@ impl ShgoResult {
             nit: 0,
             nlfev: 0,
             time: 0.0,
+            basins: None,
         }
     }
 }
@@ -387,6 +445,157 @@ impl Default for LMapCache {
     fn default() -> Self {
         Self::new()
     }
+}
+
+/// Compute per-basin statistics over an evaluated vertex cache.
+///
+/// Steepest-descent labeling under the total order (f, index) assigns each
+/// finite vertex to a graph minimizer; a union-find sweep in ascending order
+/// computes persistence with the elder rule. Deterministic.
+fn compute_basin_statistics<F2, G2>(
+    cache: &crate::vertex::VertexCache<F2, G2>,
+    lmap_cache: &LMapCache,
+    thresholds: &[f64],
+    tail_fraction: f64,
+) -> Vec<BasinStats>
+where
+    F2: Fn(&[f64]) -> f64 + Send + Sync,
+    G2: Fn(&[f64]) -> bool + Send + Sync,
+{
+    use std::collections::HashMap;
+
+    let vertices: Vec<std::sync::Arc<crate::Vertex>> = cache.iter().collect();
+    let n = vertices.len();
+    let fs: Vec<f64> = vertices
+        .iter()
+        .map(|v| v.f().unwrap_or(f64::INFINITY))
+        .collect();
+    let finite: Vec<bool> = fs.iter().map(|f| f.is_finite()).collect();
+    let lower = |a: usize, b: usize| {
+        (fs[a], a) < (fs[b], b) // total order breaks cost ties by index
+    };
+
+    // Steepest-descent parent per vertex (self if graph minimizer).
+    let mut parent: Vec<usize> = (0..n).collect();
+    for i in 0..n {
+        if !finite[i] {
+            continue;
+        }
+        let mut best = i;
+        for &nb in &vertices[i].neighbor_indices() {
+            if nb < n && finite[nb] && lower(nb, best) {
+                best = nb;
+            }
+        }
+        parent[i] = best;
+    }
+
+    // Resolve roots with path compression (parent chains strictly descend
+    // in (f, index), so they are acyclic).
+    let mut root: Vec<usize> = (0..n).collect();
+    for i in 0..n {
+        if !finite[i] {
+            continue;
+        }
+        let mut r = i;
+        while parent[r] != r {
+            r = parent[r];
+        }
+        let mut c = i;
+        while parent[c] != c {
+            let nx = parent[c];
+            parent[c] = r;
+            c = nx;
+        }
+        root[i] = r;
+    }
+
+    // Persistence: process vertices in ascending (f, index); merging a
+    // younger component (higher minimum) into an elder one records the
+    // younger basin's death at the current cost.
+    fn find(uf: &mut [usize], mut x: usize) -> usize {
+        while uf[x] != x {
+            uf[x] = uf[uf[x]];
+            x = uf[x];
+        }
+        x
+    }
+    let mut order: Vec<usize> = (0..n).filter(|&i| finite[i]).collect();
+    order.sort_by(|&a, &b| {
+        fs[a].partial_cmp(&fs[b])
+            .unwrap_or(std::cmp::Ordering::Equal)
+            .then(a.cmp(&b))
+    });
+    let mut uf: Vec<usize> = (0..n).collect();
+    let comp_min: Vec<usize> = (0..n).collect();
+    let mut processed = vec![false; n];
+    let mut persistence: HashMap<usize, f64> = HashMap::new();
+    for &v in &order {
+        processed[v] = true;
+        for &nb in &vertices[v].neighbor_indices() {
+            if nb >= n || !processed[nb] {
+                continue;
+            }
+            let rv = find(&mut uf, v);
+            let rn = find(&mut uf, nb);
+            if rv == rn {
+                continue;
+            }
+            let (elder, younger) = if lower(comp_min[rv], comp_min[rn]) {
+                (rv, rn)
+            } else {
+                (rn, rv)
+            };
+            persistence.insert(comp_min[younger], fs[v] - fs[comp_min[younger]]);
+            uf[younger] = elder;
+        }
+    }
+
+    // Aggregate member costs per basin root.
+    let mut members: HashMap<usize, Vec<f64>> = HashMap::new();
+    for i in 0..n {
+        if finite[i] {
+            members.entry(root[i]).or_default().push(fs[i]);
+        }
+    }
+
+    let mut out: Vec<BasinStats> = members
+        .into_iter()
+        .map(|(r, mut fvals)| {
+            fvals.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+            let size = fvals.len();
+            let f_mean = fvals.iter().sum::<f64>() / size as f64;
+            let f_median = fvals[size / 2];
+            let tail_n = ((size as f64 * tail_fraction).ceil() as usize).clamp(1, size);
+            let f_tail = fvals[size - tail_n..].iter().sum::<f64>() / tail_n as f64;
+            let good_counts = thresholds
+                .iter()
+                .map(|&t| fvals.partition_point(|&f| f <= t))
+                .collect();
+            let x_sampled = vertices[r].x().to_vec();
+            let x_polished = lmap_cache
+                .get(&Coordinates::new(x_sampled.clone()))
+                .map(|lm| lm.x);
+            BasinStats {
+                xl_index: None,
+                x_sampled,
+                x_polished,
+                f_min_sampled: fs[r],
+                size,
+                f_mean,
+                f_median,
+                f_tail,
+                good_counts,
+                persistence: persistence.get(&r).copied().unwrap_or(f64::INFINITY),
+            }
+        })
+        .collect();
+    out.sort_by(|a, b| {
+        a.f_min_sampled
+            .partial_cmp(&b.f_min_sampled)
+            .unwrap_or(std::cmp::Ordering::Equal)
+    });
+    out
 }
 
 /// SHGO (Simplicial Homology Global Optimization) optimizer.
@@ -657,6 +866,20 @@ where
             }
         }
 
+        // Map each basin to its polished xl row now that xl is final.
+        {
+            let ShgoResult { xl, basins, .. } = &mut result;
+            if let Some(basins) = basins.as_mut() {
+                for b in basins.iter_mut() {
+                    let key = b.x_polished.as_ref().unwrap_or(&b.x_sampled);
+                    b.xl_index = xl.iter().position(|x| {
+                        x.len() == key.len()
+                            && x.iter().zip(key.iter()).all(|(a, c)| (a - c).abs() <= 1e-8)
+                    });
+                }
+            }
+        }
+
         if self.options.disp > 0 {
             self.print_summary(&result);
         }
@@ -886,6 +1109,15 @@ where
                 result.x = x;
                 result.fun = lowest_f;
             }
+        }
+
+        if self.options.compute_basin_stats {
+            result.basins = Some(compute_basin_statistics(
+                &complex.cache,
+                &lmap_cache,
+                &self.options.basin_good_thresholds,
+                self.options.basin_tail_fraction,
+            ));
         }
 
         Ok(())
@@ -1170,6 +1402,15 @@ where
                 result.x = x;
                 result.fun = lowest_f;
             }
+        }
+
+        if self.options.compute_basin_stats {
+            result.basins = Some(compute_basin_statistics(
+                &cache,
+                &lmap_cache,
+                &self.options.basin_good_thresholds,
+                self.options.basin_tail_fraction,
+            ));
         }
 
         Ok(())
@@ -2325,6 +2566,60 @@ mod tests {
             "expected ~20 sampling evals (5/iter x 4 iters), got {}",
             sampling_evals
         );
+    }
+
+    #[test]
+    fn test_basin_stats_double_well() {
+        // Double well in x (global near x=-1, local near x=+1) + bowl in y.
+        let f = |x: &[f64]| (x[0] * x[0] - 1.0).powi(2) + 0.1 * x[0] + x[1] * x[1];
+        let options = ShgoOptions {
+            sampling_method: SamplingMethod::Sobol,
+            connectivity_method: ConnectivityMethod::KNearestNeighbors,
+            n: 256,
+            iters: Some(1),
+            compute_basin_stats: true,
+            basin_good_thresholds: vec![0.5],
+            ..Default::default()
+        };
+        let run = || {
+            Shgo::new(f, vec![(-2.0, 2.0), (-2.0, 2.0)])
+                .with_options(options.clone())
+                .minimize()
+                .unwrap()
+        };
+        let result = run();
+        let basins = result.basins.expect("basin stats were requested");
+        assert!(!basins.is_empty());
+
+        // Every feasible sampled point belongs to exactly one basin.
+        let total: usize = basins.iter().map(|b| b.size).sum();
+        assert_eq!(total, 256);
+
+        // Sorted ascending by sampled minimum; the global basin (x < 0)
+        // comes first and has infinite persistence (it never merges).
+        assert!(basins[0].persistence.is_infinite());
+        assert!(basins[0].x_sampled[0] < 0.0);
+        assert!(basins[0].size > 40, "global well should hold a large share");
+
+        for b in &basins {
+            assert!(b.good_counts[0] <= b.size);
+            assert!(b.f_median >= b.f_min_sampled);
+            assert!(b.f_tail >= b.f_median);
+        }
+
+        // The global basin's graph minimizer was polished and maps to xl.
+        assert!(basins[0].xl_index.is_some());
+        let i = basins[0].xl_index.unwrap();
+        assert!(result.xl[i][0] < 0.0);
+
+        // Deterministic across runs.
+        let result2 = run();
+        let basins2 = result2.basins.unwrap();
+        assert_eq!(basins.len(), basins2.len());
+        for (a, b) in basins.iter().zip(basins2.iter()) {
+            assert_eq!(a.size, b.size);
+            assert_eq!(a.x_sampled, b.x_sampled);
+        }
     }
 
     #[test]
