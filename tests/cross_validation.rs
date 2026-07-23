@@ -4,7 +4,7 @@
 //! as the Python implementation.
 
 use serde::Deserialize;
-use shgo::{Complex, Coordinates, Sobol, VertexCache};
+use shgo::{Complex, Coordinates, SamplingMethod, Shgo, ShgoOptions, Sobol, VertexCache};
 use std::collections::HashMap;
 use std::fs;
 use std::path::PathBuf;
@@ -97,6 +97,24 @@ struct NeighborData {
     coords: Vec<f64>,
     f: f64,
     is_minimizer: bool,
+}
+
+#[derive(Debug, Deserialize)]
+struct E2ETests {
+    cases: Vec<E2ECase>,
+}
+
+#[derive(Debug, Deserialize)]
+struct E2ECase {
+    name: String,
+    func: String,
+    bounds: Vec<Vec<f64>>,
+    n: usize,
+    iters: usize,
+    sampling_method: String,
+    constrained: bool,
+    fun: f64,
+    x: Vec<f64>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -520,6 +538,70 @@ fn test_sobol_sequence_matches_python() {
                 (rust_val - python_val).abs() < 1e-10,
                 "5D Sobol mismatch at point {}, dim {}: Rust={}, Python={}",
                 i, j, rust_val, python_val
+            );
+        }
+    }
+}
+
+#[test]
+fn test_end_to_end_matches_scipy() {
+    // Replays the configurations recorded by tests/generate_e2e_fixtures.py
+    // through the Rust implementation and asserts the found optimum agrees
+    // with scipy.optimize.shgo. Tolerances absorb the local-minimizer
+    // difference (SciPy: SLSQP, Rust: BOBYQA) on these well-conditioned
+    // optima.
+    let fixture_path = fixtures_dir().join("end_to_end_tests.json");
+    let content = fs::read_to_string(&fixture_path)
+        .unwrap_or_else(|e| panic!("Failed to read {:?}: {}", fixture_path, e));
+    let tests: E2ETests = serde_json::from_str(&content)
+        .unwrap_or_else(|e| panic!("Failed to parse fixture: {}", e));
+
+    for case in &tests.cases {
+        let bounds: Vec<(f64, f64)> = case.bounds.iter().map(|b| (b[0], b[1])).collect();
+        let options = ShgoOptions {
+            n: case.n,
+            iters: Some(case.iters),
+            sampling_method: match case.sampling_method.as_str() {
+                "sobol" => SamplingMethod::Sobol,
+                _ => SamplingMethod::Simplicial,
+            },
+            ..Default::default()
+        };
+        let func: fn(&[f64]) -> f64 = match case.func.as_str() {
+            "rosenbrock" => {
+                |x: &[f64]| (1.0 - x[0]).powi(2) + 100.0 * (x[1] - x[0].powi(2)).powi(2)
+            }
+            "sphere" => |x: &[f64]| x.iter().map(|v| v * v).sum(),
+            other => panic!("unknown fixture function {other}"),
+        };
+
+        let result = if case.constrained {
+            Shgo::with_constraints(func, bounds, vec![|x: &[f64]| x[0] + x[1] - 1.0])
+                .with_options(options)
+                .minimize()
+                .unwrap()
+        } else {
+            Shgo::new(func, bounds)
+                .with_options(options)
+                .minimize()
+                .unwrap()
+        };
+
+        assert!(
+            (result.fun - case.fun).abs() <= 1e-6,
+            "{}: fun {} vs scipy {}",
+            case.name,
+            result.fun,
+            case.fun
+        );
+        for (i, (a, b)) in result.x.iter().zip(case.x.iter()).enumerate() {
+            assert!(
+                (a - b).abs() <= 1e-3,
+                "{}: x[{}] = {} vs scipy {}",
+                case.name,
+                i,
+                a,
+                b
             );
         }
     }

@@ -195,10 +195,6 @@ pub struct ShgoOptions {
     /// Default: 1e-4
     pub f_tol: f64,
 
-    /// Minimum fraction of feasible vertices required.
-    /// Default: 0.5
-    pub min_feasible_ratio: f64,
-
     /// Number of sampling points per iteration.
     /// For Simplicial with n=0: auto-computed as 2^dim + 1.
     /// For Sobol with n=0: defaults to 128.
@@ -217,10 +213,6 @@ pub struct ShgoOptions {
     /// Default: None (no limit).
     pub maxiter_local: Option<usize>,
 
-    /// Whether to use symmetry exploitation.
-    /// Default: true
-    pub symmetry: bool,
-
     /// Verbosity level (0 = silent, 1 = summary, 2 = detailed).
     /// Default: 0
     pub disp: usize,
@@ -228,11 +220,6 @@ pub struct ShgoOptions {
     /// Number of initial Sobol points to skip.
     /// Default: 0 (include the origin, matching Python's scipy.stats.qmc.Sobol)
     pub sobol_skip: usize,
-
-    /// Infinite bounds replacement value.
-    /// Python maps non-finite bounds to ±1e50.
-    /// Default: 1e50
-    pub infty_constraints: f64,
 
     /// Options for the local optimizer (including which algorithm to use).
     /// The algorithm is controlled by `local_options.algorithm`.
@@ -267,15 +254,12 @@ impl Default for ShgoOptions {
             maxtime: None,
             f_min: None,
             f_tol: 1e-4,
-            min_feasible_ratio: 0.5,
             n: 0, // Auto: 2^dim + 1 for simplicial, 128 for sobol
             sampling_method: SamplingMethod::Simplicial,
             minimize_every_iter: true,
             maxiter_local: None,
-            symmetry: true,
             disp: 0,
             sobol_skip: 0,
-            infty_constraints: 1e50,
             local_options: crate::local_opt::LocalOptimizerOptions {
                 algorithm: crate::local_opt::LocalOptimizer::Bobyqa,
                 ftol_rel: 1e-12,
@@ -789,7 +773,7 @@ where
                 let maxiter_local = self.options.maxiter_local.unwrap_or(usize::MAX);
 
                 // Collect candidates: feasible, not already in LMC
-                let candidates: Vec<_> = minimizers
+                let mut candidates: Vec<_> = minimizers
                     .iter()
                     .filter(|v| v.feasible() != Some(false))
                     .filter(|v| {
@@ -797,8 +781,17 @@ where
                             v.coordinates().as_slice().to_vec(),
                         ))
                     })
-                    .take(maxiter_local)
                     .collect();
+                // SciPy sorts the minimizer pool by function value
+                // (sort_min_pool) before trimming to `local_iter` candidates,
+                // so truncation keeps the most promising starts.
+                candidates.sort_by(|a, b| {
+                    a.f()
+                        .unwrap_or(f64::INFINITY)
+                        .partial_cmp(&b.f().unwrap_or(f64::INFINITY))
+                        .unwrap_or(std::cmp::Ordering::Equal)
+                });
+                candidates.truncate(maxiter_local);
 
                 if !candidates.is_empty() {
                     // Pre-compute starting points and locally convex bounds
@@ -820,12 +813,15 @@ where
                         })
                         .collect();
 
-                    // Gather successful results (order-independent: results are
+                    // Gather results (order-independent: results are
                     // deterministic per starting point via lmap_cache dedup).
-                    // nlfev is taken from lmap_cache.total_fev() after the loop
-                    // so failed attempts count too (matching SciPy's LMC).
+                    // SciPy's LMC.add_res appends EVERY local result to the
+                    // minima maps, converged or not — so budget-capped runs
+                    // still count; only non-finite failures are excluded.
+                    // nlfev is taken from lmap_cache.total_fev() after the
+                    // loop so all attempts count (matching SciPy's LMC).
                     for local_min in local_results.into_iter().flatten() {
-                        if local_min.success {
+                        if local_min.fun.is_finite() {
                             result.xl.push(local_min.x);
                             result.funl.push(local_min.fun);
                         }
@@ -989,56 +985,53 @@ where
                 }
             }
 
-            // Create vertices and store in input order for Delaunay index mapping
-            let vertices_in_order: Vec<std::sync::Arc<crate::Vertex>> = points
-                .iter()
-                .map(|p| cache.get_or_create(p.clone()))
-                .collect();
+            // Instantiate this batch's vertices in the cache (connectivity
+            // is built over the full cumulative cache below).
+            for p in &points {
+                cache.get_or_create(p.clone());
+            }
 
             // ---- Build vertex connectivity ----
+            // All methods build the graph over the FULL cumulative point
+            // cloud, matching SciPy's semantics of re-triangulating all
+            // sampled points each iteration (scipy: `Tri.add_points` on the
+            // accumulated `self.C`). Per-batch graphs would leave earlier
+            // iterations' vertices with stale neighborhoods and no old↔new
+            // edges. On iteration 1 the cache equals the batch, so this is
+            // identical to per-batch there. The cache is deduplicated by
+            // construction, so re-inserted minima coinciding with sample
+            // points cost nothing extra.
+            let all_vertices: Vec<std::sync::Arc<crate::Vertex>> = cache.iter().collect();
             // Need at least dim+2 non-degenerate points for triangulation
-            if points.len() >= self.dim + 2 {
+            if all_vertices.len() >= self.dim + 2 {
+                let all_points: Vec<Vec<f64>> =
+                    all_vertices.iter().map(|v| v.x().to_vec()).collect();
+
                 if self.dim == 1 {
                     // 1D: sort points and connect consecutive pairs
                     // (Delaunay in 1D is just sorted adjacency)
-                    let mut sorted_indices: Vec<usize> = (0..points.len()).collect();
+                    let mut sorted_indices: Vec<usize> = (0..all_points.len()).collect();
                     sorted_indices.sort_by(|&a, &b| {
-                        points[a][0]
-                            .partial_cmp(&points[b][0])
+                        all_points[a][0]
+                            .partial_cmp(&all_points[b][0])
                             .unwrap_or(std::cmp::Ordering::Equal)
                     });
                     for w in sorted_indices.windows(2) {
                         crate::Vertex::connect_bidirectional(
-                            &vertices_in_order[w[0]],
-                            &vertices_in_order[w[1]],
+                            &all_vertices[w[0]],
+                            &all_vertices[w[1]],
                         );
                     }
-                } else if self.options.connectivity_method == ConnectivityMethod::Delaunay {
-                    // Delaunay keeps per-batch scope for now (cumulative /
-                    // incremental triangulation is tracked separately —
-                    // see shgo_fable_recommendations.md §4.2).
-                    Self::build_delaunay_connectivity(
-                        &points,
-                        &vertices_in_order,
-                        self.dim,
-                        self.options.disp,
-                    )?;
                 } else {
-                    // ANN methods build the graph over the FULL cumulative
-                    // point cloud, matching SciPy's semantics of
-                    // re-triangulating all sampled points each iteration.
-                    // Per-batch graphs would leave earlier iterations'
-                    // vertices with stale neighborhoods and no old↔new
-                    // edges. On iteration 1 the cache equals the batch, so
-                    // this is identical to per-batch there. The cache is
-                    // deduplicated by construction, so re-inserted minima
-                    // coinciding with sample points cost nothing extra.
-                    let all_vertices: Vec<std::sync::Arc<crate::Vertex>> =
-                        cache.iter().collect();
-                    let all_points: Vec<Vec<f64>> =
-                        all_vertices.iter().map(|v| v.x().to_vec()).collect();
-
                     match self.options.connectivity_method {
+                        ConnectivityMethod::Delaunay => {
+                            Self::build_delaunay_connectivity(
+                                &all_points,
+                                &all_vertices,
+                                self.dim,
+                                self.options.disp,
+                            )?;
+                        }
                         ConnectivityMethod::KNearestNeighbors => {
                             Self::build_knn_connectivity(
                                 &all_points,
@@ -1066,7 +1059,6 @@ where
                                 self.options.disp,
                             );
                         }
-                        ConnectivityMethod::Delaunay => unreachable!(),
                     }
                 }
             }
@@ -1082,12 +1074,20 @@ where
             if self.options.minimize_every_iter {
                 // Filter to feasible vertices, not in LMC, limited count
                 let maxiter_local = self.options.maxiter_local.unwrap_or(usize::MAX);
-                let candidates: Vec<_> = minimizers
+                let mut candidates: Vec<_> = minimizers
                     .iter()
                     .filter(|v| v.feasible() != Some(false))
                     .filter(|v| !lmap_cache.contains(&Coordinates::new(v.coordinates().as_slice().to_vec())))
-                    .take(maxiter_local)
                     .collect();
+                // SciPy sorts the minimizer pool by function value
+                // (sort_min_pool) before trimming to `local_iter` candidates.
+                candidates.sort_by(|a, b| {
+                    a.f()
+                        .unwrap_or(f64::INFINITY)
+                        .partial_cmp(&b.f().unwrap_or(f64::INFINITY))
+                        .unwrap_or(std::cmp::Ordering::Equal)
+                });
+                candidates.truncate(maxiter_local);
 
                 // Local minimization with GLOBAL bounds in parallel
                 // (matching Python's construct_lcb_delaunay which returns global bounds
@@ -1100,10 +1100,12 @@ where
                     })
                     .collect();
 
-                // nlfev is taken from lmap_cache.total_fev() after the loop
-                // so failed attempts count too (matching SciPy's LMC).
+                // SciPy's LMC.add_res appends EVERY local result to the
+                // minima maps, converged or not — only non-finite failures
+                // are excluded. nlfev is taken from lmap_cache.total_fev()
+                // after the loop so all attempts count (matching SciPy).
                 for local_min in local_results.into_iter().flatten() {
-                    if local_min.success {
+                    if local_min.fun.is_finite() {
                         result.xl.push(local_min.x);
                         result.funl.push(local_min.fun);
                     }
@@ -1461,6 +1463,7 @@ where
         }
 
         // Query each point for k nearest neighbors
+        let mut failed: Vec<usize> = Vec::new();
         for i in 0..n {
             match index.search(&f32_points[i], k + 1) {
                 Ok(results) => {
@@ -1472,7 +1475,43 @@ where
                         }
                     }
                 }
-                Err(_) => {} // skip failures silently
+                Err(_) => failed.push(i),
+            }
+        }
+
+        // A vertex left with no neighbors vacuously passes the minimizer
+        // test and spawns a spurious local minimization, so failed queries
+        // get exact brute-force neighbors instead of being skipped.
+        if !failed.is_empty() {
+            if disp > 0 {
+                eprintln!(
+                    "Warning: ScaNN search failed for {} of {} points; \
+                     using brute-force k-NN for those",
+                    failed.len(),
+                    n
+                );
+            }
+            for &i in &failed {
+                let mut dists: Vec<(usize, f64)> = (0..n)
+                    .filter(|&j| j != i)
+                    .map(|j| {
+                        let d2: f64 = points[i]
+                            .iter()
+                            .zip(points[j].iter())
+                            .map(|(a, b)| (a - b).powi(2))
+                            .sum();
+                        (j, d2)
+                    })
+                    .collect();
+                if dists.len() > k {
+                    dists.select_nth_unstable_by(k - 1, |a, b| {
+                        a.1.partial_cmp(&b.1).unwrap_or(std::cmp::Ordering::Equal)
+                    });
+                    dists.truncate(k);
+                }
+                for &(j, _) in &dists {
+                    crate::Vertex::connect_bidirectional(&vertices[i], &vertices[j]);
+                }
             }
         }
 

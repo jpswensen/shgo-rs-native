@@ -81,6 +81,21 @@ reported `res.nfev` is buggy in multi-iteration simplicial runs** — it reports
 Rust reports true counts, so do NOT chase parity against SciPy's reported number.
 Suite: 103 unit + 10 cross-validation + 21 doctests green.
 
+**P2 batch (same session):** 4.2 completed — Delaunay now also triangulates the full
+cumulative cloud each iteration (benchmark: 239 → 266 minima found on rastrigin 4-D,
+fun unchanged); 4.6 — minimizer pool sorted by f before `maxiter_local` truncation
+(SciPy `sort_min_pool` parity); 4.7 — resolved the *opposite* way the original audit
+guessed: reading SciPy showed `LMC.add_res` appends EVERY local result to the minima
+maps unconditionally, so Rust now includes all finite local results in `xl` (converged
+or budget-capped) instead of filtering on `success` — budget-capped COBYLA/BOBYQA runs
+count; 4.8 — dead options (`symmetry`, `min_feasible_ratio`, `infty_constraints`)
+deleted (small API break; no known consumer used them); ScaNN per-point query failures
+now fall back to brute-force k-NN instead of leaving isolated vertices; §7 — end-to-end
+SciPy fixtures added (`tests/generate_e2e_fixtures.py` →
+`tests/fixtures/end_to_end_tests.json`, replayed by `test_end_to_end_matches_scipy`).
+KNN/simplicial/constrained benchmark cases stayed bitwise identical through the batch.
+Suite: 103 unit + 11 cross-validation + 21 doctests green.
+
 ## 1. The KNN / connectivity work: exists on GitHub since April 2026
 
 Commit `157e8fd` ("Add 4 connectivity methods for Sobol mode + performance
@@ -218,13 +233,13 @@ returning it from the iterate functions or hoisting the cache).
 | # | Deviation | Where | Impact |
 |---|---|---|---|
 | 4.1 | ~~`maxev` compares against function evaluations instead of sampled points~~ **FIXED (2026-07-22)** | — | SciPy checks `n_sampled >= maxev` (sampling points incl. infeasible); Rust reuses `fev_count`, making `maxev` a duplicate of `maxfev`. Fix: track points generated / vertex-cache size. |
-| 4.2 | Sobol mode builds connectivity over only the new batch — **fixed for KNN/HNSW/ScaNN (2026-07-22); Delaunay still per-batch (P2)** | src/shgo.rs:995–1060 | SciPy accumulates all points in `self.C` and re/incrementally triangulates the whole cloud (`Tri.add_points`), so old vertices gain new neighbors and stale minimizers get disqualified. Rust leaves old vertices with stale neighborhoods and never connects old↔new; the new KNN/HNSW/ScaNN builders inherit the same per-batch scope. Single-iteration runs are unaffected; multi-iteration runs produce extra local-minimization candidates (LMC dedup keeps this cheap, but it deviates from SciPy). For KNN this is trivially fixable: build the graph over *all* cached vertices each iteration. |
+| 4.2 | ~~Sobol mode builds connectivity over only the new batch~~ **FIXED (2026-07-22)** — all four methods now build over the full cumulative cloud | src/shgo.rs:995–1060 | SciPy accumulates all points in `self.C` and re/incrementally triangulates the whole cloud (`Tri.add_points`), so old vertices gain new neighbors and stale minimizers get disqualified. Rust leaves old vertices with stale neighborhoods and never connects old↔new; the new KNN/HNSW/ScaNN builders inherit the same per-batch scope. Single-iteration runs are unaffected; multi-iteration runs produce extra local-minimization candidates (LMC dedup keeps this cheap, but it deviates from SciPy). For KNN this is trivially fixable: build the graph over *all* cached vertices each iteration. |
 | 4.3 | ~~Default simplicial iteration refines the whole complex~~ **FIXED (2026-07-22)**: every iteration adds ~n = 2^dim+1 points via budgeted incremental refinement | — | With default `n=0`, every iteration calls `refine_all` → super-exponential vertex growth (≈3^dim per generation). SciPy's default resolves `n = 2^dim + 1` and calls `refine(n)`, adding ~n targeted points per iteration (linear growth). Combined with 3.1 this is the other half of the scaling wall. |
 | 4.4 | **Mostly fixed (2026-07-22)**: `refine(Some(n))` is now budgeted (+n per call). Remaining: `cyclic_product_limited` still builds the full 2^dim initial product, so requesting n < 2^dim+1 initial vertices overshoots iteration 1 (SciPy stops mid-product via a resumable generator) — matters only above dim ≈ 15–20 | src/complex.rs | `refine(n)` loops `refine_all` until `len ≥ target` (can add thousands for n=5); the initial triangulation always builds all 2^dim corners regardless of `n` (1M vertices at dim=20 before refinement starts). SciPy's `Complex.triangulate(n)`/`refine(n)` are incremental and bounded. This makes simplicial mode unusable beyond dim ≈ 15 even for tiny n. |
 | 4.5 | ~~One extra refinement generation in every simplicial run~~ **FIXED (2026-07-22)**: iteration 1 = bounded initial triangulation only; Rust 9-D default now samples exactly 513 points like SciPy. (The earlier "SciPy adds no sampling after iteration 1" reading was an artifact of SciPy's stale-`fn` nfev reporting bug — actual SciPy growth is +n per iteration, which Rust now matches.) | — | Rust triangulates *before* the loop and refines *inside* iteration 1; SciPy's first iteration is the initial triangulation only. Default `iters=1` therefore samples ~3^dim points where SciPy samples 2^dim+1 — different nfev, different minimizer pool. The cross-validation suite doesn't catch it because there is no end-to-end fixture (see §7). |
-| 4.6 | `maxiter_local` truncates an unsorted pool | src/shgo.rs:802, 1072 | SciPy sorts the minimizer pool by function value (`sort_min_pool`) before trimming; Rust `.take(maxiter_local)` grabs insertion-order candidates. Fix: sort candidates by vertex f before `take`. (Abandoning `g_topograph` distance ordering for the parallel pool is fine — order no longer affects results because all candidates run — but *which* candidates survive truncation should match.) |
-| 4.7 | Unconverged local results counted as successes | src/local_opt.rs:341, 501 | NLopt `MaxevalReached`/`MaxtimeReached` return `Ok` → `success: true`, so unconverged points enter `xl`. SciPy filters on `lres.success`. Consider mapping maxeval/maxtime termination to `success=false` (or a separate flag) to match. |
-| 4.8 | Dead options: `symmetry`, `min_feasible_ratio`, `infty_constraints` | src/shgo.rs:200–278 | Declared, documented in README, never read. Worse, `symmetry` defaults to `true` while SciPy defaults symmetry *off* — a user reading the README expects an active feature. `infty_constraints` is hardcoded as `1e50` in `process_bounds`. Either implement or delete the fields; deleting is honest. |
+| 4.6 | ~~`maxiter_local` truncates an unsorted pool~~ **FIXED (2026-07-22)** — pool sorted by f before truncation (SciPy `sort_min_pool` parity) | — | SciPy sorts the minimizer pool by function value (`sort_min_pool`) before trimming; Rust `.take(maxiter_local)` grabs insertion-order candidates. Fix: sort candidates by vertex f before `take`. (Abandoning `g_topograph` distance ordering for the parallel pool is fine — order no longer affects results because all candidates run — but *which* candidates survive truncation should match.) |
+| 4.7 | ~~Unconverged local results counted as successes~~ **RESOLVED inversely (2026-07-22)** — SciPy appends every local result to its minima maps (`LMC.add_res`, no success gate), so the Rust `success` filter was the deviation; all finite local results now enter `xl` | — | NLopt `MaxevalReached`/`MaxtimeReached` return `Ok` → `success: true`, so unconverged points enter `xl`. SciPy filters on `lres.success`. Consider mapping maxeval/maxtime termination to `success=false` (or a separate flag) to match. |
+| 4.8 | ~~Dead options~~ **FIXED (2026-07-22)** — `symmetry`, `min_feasible_ratio`, `infty_constraints` deleted (API break; no consumer used them) | — | Declared, documented in README, never read. Worse, `symmetry` defaults to `true` while SciPy defaults symmetry *off* — a user reading the README expects an active feature. `infty_constraints` is hardcoded as `1e50` in `process_bounds`. Either implement or delete the fields; deleting is honest. |
 | 4.9 | `minhgrd` (homology-growth stopping) not ported | — | Niche SciPy option; document as unsupported. |
 | 4.10 | `xl` dedup uses absolute 1e-10 tolerance | src/shgo.rs:640–650 | An extension (SciPy keeps per-start entries). Fine, but absolute tolerance is scale-dependent: distinct minima closer than 1e-10 merge; at bounds like ±1e50, nothing ever merges meaningfully. Use a relative tolerance or document. |
 | 4.11 | ~~Delaunay failure aborts the whole run~~ **FIXED in 32f5edb** (April 2026) | — | A joggle retry now handles cocircular/degenerate point sets, and the KNN/HNSW/ScaNN methods avoid qhull entirely. |
@@ -354,10 +369,10 @@ Recommended additions, in order of value:
 | ~~P1~~ ✅ | 6/4.2 build ANN graphs over all cached vertices (cumulative) | done |
 | ~~P1~~ ✅ | 3.4 nfev accounting; 4.1 maxev semantics | done |
 | ~~P1~~ ✅ | 4.3/4.4/4.5 simplicial growth control (budgeted refine, SciPy-parity growth) — residual: mid-product initial triangulation for n < 2^dim+1 | done |
-| P2 | 4.2 cumulative/incremental Delaunay per iteration | ~0.5 day |
-| P2 | 4.6 sort pool before `maxiter_local`; 4.7 success semantics; 4.8 delete dead options | ~2 h |
-| P2 | 7. end-to-end SciPy fixtures + fixture-generation setup | ~0.5 day |
-| P2 | 6. ScaNN: fail loudly on per-point query errors (isolated-vertex → spurious candidate) | ~30 min |
+| ~~P2~~ ✅ | 4.2 cumulative Delaunay per iteration | done |
+| ~~P2~~ ✅ | 4.6 sorted pool; 4.7 SciPy-parity xl inclusion; 4.8 dead options deleted | done |
+| ~~P2~~ ✅ | 7. end-to-end SciPy fixtures (`generate_e2e_fixtures.py` + `test_end_to_end_matches_scipy`) | done |
+| ~~P2~~ ✅ | 6. ScaNN: failed queries fall back to brute-force k-NN (no isolated vertices) | done |
 | P3 | §5 hygiene: unsafe impls, clippy, README corrections, `.gitignore` `._*`, FFI option docs, push-or-discard the divergent tcdts checkout commits | ~2 h |
 
 The KNN capability itself shipped in April (157e8fd) and the trader is pinned to it.

@@ -130,8 +130,8 @@ let result = Shgo::new(eggholder, vec![(-512.0, 512.0), (-512.0, 512.0)])
 
 println!("Global minimum: {:.6} at {:?}", result.fun, result.x);
 println!("All {} local minima found:", result.xl.len());
-for (i, lm) in result.xl.iter().enumerate() {
-    println!("  [{}] f={:.6} at {:?}", i, lm.fun, lm.x);
+for (i, (x, f)) in result.xl.iter().zip(result.funl.iter()).enumerate() {
+    println!("  [{}] f={:.6} at {:?}", i, f, x);
 }
 ```
 
@@ -152,9 +152,8 @@ for (i, lm) in result.xl.iter().enumerate() {
 | `sampling_method` | `SamplingMethod` | `Simplicial` | Sampling strategy |
 | `minimize_every_iter` | `bool` | `true` | Run local minimization each iter |
 | `maxiter_local` | `Option<usize>` | `None` | Max local minimizations per iter |
-| `symmetry` | `bool` | `true` | Exploit function symmetry |
 | `disp` | `usize` | `0` | Verbosity (0=silent, 1=summary, 2=detailed) |
-| `local_optimizer` | `LocalOptimizer` | `Bobyqa` | Local solver algorithm |
+| `local_options` | `LocalOptimizerOptions` | BOBYQA, tol 1e-12 | Local solver algorithm + tolerances (`local_options.algorithm`) |
 | `workers` | `Option<usize>` | `None` | Thread count (`None` = all cores) |
 | `f_min` + `f_tol` | — | — | Precision-based early stopping |
 
@@ -237,7 +236,7 @@ Function evaluations during **local minimization** are parallelized using
 |---|---|---|
 | `x` | `Vec<f64>` | Best parameter vector found |
 | `fun` | `f64` | Function value at `x` |
-| `xl` | `Vec<LocalMinimum>` | All local minima discovered |
+| `xl` | `Vec<Vec<f64>>` | Locations of all local minima discovered |
 | `funl` | `Vec<f64>` | Function values at all local minima |
 | `success` | `bool` | Whether optimization succeeded |
 | `message` | `String` | Human-readable status message |
