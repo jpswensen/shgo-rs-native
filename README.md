@@ -20,7 +20,8 @@ among them. Key properties:
 - **Two sampling modes** — *Simplicial* (default, topology-aware) and *Sobol*
   (quasi-random, higher dimensional).
 
-This crate is a **100% fidelity port** of the SciPy SHGO implementation.
+This crate is a faithful port of the SciPy SHGO implementation, with all
+deviations and extensions documented (see `shgo_fable_recommendations.md`).
 Python cross-validation fixtures cover Sobol sequences, Delaunay
 triangulation, vertex caching, the simplicial complex, minimizer pool
 construction, and final result values — all verified to match SciPy output
@@ -150,6 +151,8 @@ for (i, (x, f)) in result.xl.iter().zip(result.funl.iter()).enumerate() {
 | `f_tol` | `f64` | `1e-4` | Tolerance for `f_min` stopping criterion |
 | `n` | `usize` | `0` (auto) | Sampling points per iteration |
 | `sampling_method` | `SamplingMethod` | `Simplicial` | Sampling strategy |
+| `connectivity_method` | `ConnectivityMethod` | `Delaunay` | Sobol-mode sampling-graph construction |
+| `knn_neighbors` | `Option<usize>` | `None` (auto: 2·dim+1) | Neighbor count for KNN/HNSW/ScaNN |
 | `minimize_every_iter` | `bool` | `true` | Run local minimization each iter |
 | `maxiter_local` | `Option<usize>` | `None` | Max local minimizations per iter |
 | `disp` | `usize` | `0` | Verbosity (0=silent, 1=summary, 2=detailed) |
@@ -163,6 +166,21 @@ for (i, (x, f)) in result.xl.iter().zip(result.funl.iter()).enumerate() {
 |---|---|
 | `SamplingMethod::Simplicial` | Topology-aware simplicial complex (default). Auto-scales: `2^dim + 1` points. Best for low-to-mid dimensions. |
 | `SamplingMethod::Sobol` | Quasi-random Sobol sequence (128 points default). Better coverage in higher dimensions. |
+
+### Connectivity Methods (Sobol mode)
+
+The sampling graph used for topological minimizer detection is configurable via
+`connectivity_method`:
+
+| Variant | Description |
+|---|---|
+| `ConnectivityMethod::Delaunay` | QHull Delaunay triangulation (default, matches SciPy). Cost grows combinatorially with dimension — impractical above ~7 dims. |
+| `ConnectivityMethod::KNearestNeighbors` | Exact brute-force k-NN (rayon-parallel, O(n²·d)). Recommended for dim ≳ 7. |
+| `ConnectivityMethod::HNSW` | Approximate k-NN via `hnsw_rs`. Only pays off for very large point sets. |
+| `ConnectivityMethod::ScaNN` | Quantized approximate k-NN via `vecstore` (experimental; falls back to exact k-NN on failure). |
+
+All methods build the graph over the full cumulative point cloud each iteration,
+matching SciPy's re-triangulation semantics.
 
 ### Local Optimizer Algorithms
 
@@ -303,8 +321,10 @@ cross-validation suite:
   Python `Vertex` / `VertexCache` classes.
 - **Simplicial complex** — complex construction, refinement, and minimizer
   pool topology match SciPy.
-- **Minimizer results** — final `x` and `fun` for all benchmark functions
-  verified against SciPy's `shgo()` output.
+- **Minimizer results** — end-to-end fixtures (`tests/generate_e2e_fixtures.py`)
+  record `scipy.optimize.shgo` results for sphere/Rosenbrock/constrained cases
+  across both sampling modes; `test_end_to_end_matches_scipy` replays them in
+  Rust and asserts agreement.
 
 Run the full test suite:
 

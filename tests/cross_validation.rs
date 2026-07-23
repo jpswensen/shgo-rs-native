@@ -3,6 +3,7 @@
 //! These tests ensure that the Rust implementation produces the same results
 //! as the Python implementation.
 
+#![allow(dead_code, clippy::type_complexity)]
 use serde::Deserialize;
 use shgo::{Complex, Coordinates, SamplingMethod, Shgo, ShgoOptions, Sobol, VertexCache};
 use std::collections::HashMap;
@@ -430,7 +431,7 @@ fn test_complex_field_evaluation_matches_python() {
     // Use Complex instead of raw VertexCache
     let objective = |x: &[f64]| x.iter().map(|xi| xi.powi(2)).sum::<f64>();
     let bounds = vec![(0.0, 10.0), (0.0, 10.0)]; // Wide enough for test points
-    let mut complex: Complex<_, fn(&[f64]) -> bool> = Complex::new(bounds, objective, None);
+    let complex: Complex<_, fn(&[f64]) -> bool> = Complex::new(bounds, objective, None);
     
     // Don't triangulate - just use the cache directly for this test
     // Create vertices for each test point

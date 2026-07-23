@@ -47,6 +47,16 @@ enum class SamplingMethod {
 };
 
 /**
+ * @brief Connectivity methods for Sobol-mode sampling graphs
+ */
+enum class ConnectivityMethod {
+    Delaunay = SHGO_CONNECTIVITY_DELAUNAY,
+    KNearestNeighbors = SHGO_CONNECTIVITY_KNN,
+    Hnsw = SHGO_CONNECTIVITY_HNSW,
+    Scann = SHGO_CONNECTIVITY_SCANN
+};
+
+/**
  * @brief Local optimizer algorithms
  */
 enum class LocalOptimizer {
@@ -108,12 +118,14 @@ struct Options {
     size_t maxiter = 0;                                  ///< Maximum iterations (0 = unlimited)
     size_t maxfev = 0;                                   ///< Maximum function evaluations (0 = unlimited)
     double maxtime = 0.0;                                ///< Maximum time in seconds (0 = unlimited)
-    double f_tol = 1e-12;                                ///< Function tolerance
+    double f_tol = 1e-4;                                 ///< f_min stopping tolerance (inert: f_min not exposed)
     size_t disp = 0;                                     ///< Display level (0=silent, 1=summary, 2=detailed)
     SamplingMethod sampling_method = SamplingMethod::Simplicial;
     LocalOptimizer local_optimizer = LocalOptimizer::Bobyqa;
     size_t workers = 0;                                  ///< Number of worker threads (0 = all available)
     bool minimize_every_iter = true;                     ///< Local minimize every iteration
+    ConnectivityMethod connectivity_method = ConnectivityMethod::Delaunay;  ///< Sobol-mode graph method
+    size_t knn_neighbors = 0;                            ///< k for KNN/HNSW/ScaNN (0 = auto)
     
     /// Convert to C struct
     ShgoOptions to_c() const {
@@ -128,6 +140,8 @@ struct Options {
         opts.local_optimizer = static_cast<ShgoLocalOptimizer>(local_optimizer);
         opts.workers = workers;
         opts.minimize_every_iter = minimize_every_iter;
+        opts.connectivity_method = static_cast<ShgoConnectivityMethod>(connectivity_method);
+        opts.knn_neighbors = knn_neighbors;
         return opts;
     }
 };

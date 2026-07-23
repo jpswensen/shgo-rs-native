@@ -2,9 +2,9 @@
 //!
 //! Run with: cargo bench
 
-use criterion::{black_box, criterion_group, criterion_main, Criterion, BenchmarkId};
+use std::hint::black_box;
+use criterion::{ criterion_group, criterion_main, Criterion, BenchmarkId};
 use shgo::{Coordinates, Vertex, VertexCache};
-use std::sync::Arc;
 
 fn benchmark_coordinates(c: &mut Criterion) {
     let mut group = c.benchmark_group("Coordinates");

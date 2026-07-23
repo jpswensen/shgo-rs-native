@@ -248,6 +248,16 @@ returning it from the iterate functions or hoisting the cache).
 
 ## 5. Smaller defects and hygiene
 
+*Status 2026-07-22 (P3 sweep): the `unsafe impl`s are removed, clippy is clean across
+all targets (0 warnings, was ~58), the FFI `f_tol` doc/default mismatch is fixed and
+`connectivity_method`/`knn_neighbors` are now exposed through the C API (both headers
+updated; committed example binaries removed from git and rebuilt against the new
+headers), README corrections landed (connectivity section, option rows, accurate
+verification claims), and the AppleDouble junk is deleted. Still open: FFI does not
+expose `iters`/`maxev`/`f_min`/`sobol_skip`; the SmallVec dim≤8 question; the
+`get_sorted` NaN note; and `tests/generate_fixtures.py`'s dependency on the standalone
+Python `shgo` package for the low-level fixtures.*
+
 - **`unsafe impl Send/Sync for Vertex`** (src/vertex.rs:315–316): unnecessary — every
   field is already Send+Sync (`RwLock`, `AtomicBool`, plain data). Delete both lines and
   let the compiler verify; keeping them suppresses real errors if a non-Sync field is
@@ -373,7 +383,7 @@ Recommended additions, in order of value:
 | ~~P2~~ ✅ | 4.6 sorted pool; 4.7 SciPy-parity xl inclusion; 4.8 dead options deleted | done |
 | ~~P2~~ ✅ | 7. end-to-end SciPy fixtures (`generate_e2e_fixtures.py` + `test_end_to_end_matches_scipy`) | done |
 | ~~P2~~ ✅ | 6. ScaNN: failed queries fall back to brute-force k-NN (no isolated vertices) | done |
-| P3 | §5 hygiene: unsafe impls, clippy, README corrections, `.gitignore` `._*`, FFI option docs, push-or-discard the divergent tcdts checkout commits | ~2 h |
+| ~~P3~~ ✅ | §5 hygiene: unsafe impls removed, clippy 0 warnings, README corrected, `._*` purged, FFI docs fixed + connectivity exposed to C. tcdts checkout: experiment commits bookmarked as `prune-experiment`, `github/master` fetched — finish with `git reset --hard github/master` there | done |
 
 The KNN capability itself shipped in April (157e8fd) and the trader is pinned to it.
 The P0 row — above all the O(1) lookup fix — is now the shortest path to making the

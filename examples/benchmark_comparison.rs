@@ -2,6 +2,7 @@
 //! 
 //! This outputs results in JSON format for easy comparison with Python scipy.optimize.shgo
 
+#![allow(clippy::type_complexity, clippy::too_many_arguments, dead_code)]
 use shgo::{Shgo, ShgoOptions, SamplingMethod};
 use std::time::Instant;
 

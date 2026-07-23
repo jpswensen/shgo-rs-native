@@ -310,11 +310,6 @@ impl std::fmt::Debug for Vertex {
     }
 }
 
-// Vertex is Send + Sync because all mutable fields use interior mutability
-// with thread-safe primitives (RwLock, AtomicU8)
-unsafe impl Send for Vertex {}
-unsafe impl Sync for Vertex {}
-
 /// A thread-safe cache for managing vertices in the simplicial complex.
 ///
 /// The cache provides:
@@ -926,6 +921,7 @@ mod tests {
         use std::thread;
 
         let objective = |x: &[f64]| x[0].powi(2);
+        #[allow(clippy::type_complexity)]
         let cache: Arc<VertexCache<_, fn(&[f64]) -> bool>> =
             Arc::new(VertexCache::new(objective, None));
 

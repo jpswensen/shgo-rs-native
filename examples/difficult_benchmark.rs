@@ -50,7 +50,7 @@ fn noisy_schwefel(x: &[f64]) -> f64 {
     // Simple pseudo-random based on counter and coordinates
     let mut hash = count;
     for &xi in x.iter() {
-        hash ^= (xi.to_bits() as u64).wrapping_mul(0x9e3779b97f4a7c15);
+        hash ^= xi.to_bits().wrapping_mul(0x9e3779b97f4a7c15);
         hash = hash.wrapping_mul(0x517cc1b727220a95);
     }
     

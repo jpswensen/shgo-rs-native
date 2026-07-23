@@ -5,6 +5,7 @@
 //!
 //! Run with: cargo run --example compare_with_python --release
 
+#![allow(clippy::type_complexity, clippy::too_many_arguments, dead_code)]
 use shgo::{Shgo, ShgoOptions, SamplingMethod, LocalOptimizer, LocalOptimizerOptions};
 use std::time::Instant;
 
@@ -376,8 +377,8 @@ fn main() {
     println!("  SUMMARY");
     println!("{}", "=".repeat(70));
     println!(
-        "  {:<30} {:<16} {:<8} {:<8} {:<8} {}",
-        "Test", "f(x)", "nfev", "nlfev", "minima", "ok"
+        "  {:<30} {:<16} {:<8} {:<8} {:<8} ok",
+        "Test", "f(x)", "nfev", "nlfev", "minima"
     );
     println!("  {}", "-".repeat(78));
     for r in &all_results {

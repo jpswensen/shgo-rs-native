@@ -52,6 +52,32 @@ impl From<ShgoSamplingMethod> for SamplingMethod {
     }
 }
 
+/// Connectivity methods for Sobol-mode sampling graphs
+#[repr(C)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ShgoConnectivityMethod {
+    /// Delaunay triangulation via QHull (default, matches SciPy)
+    Delaunay = 0,
+    /// Brute-force k-nearest-neighbors (fast in high dimensions)
+    KNearestNeighbors = 1,
+    /// HNSW approximate nearest neighbors
+    Hnsw = 2,
+    /// ScaNN approximate nearest neighbors (experimental)
+    Scann = 3,
+}
+
+impl From<ShgoConnectivityMethod> for crate::shgo::ConnectivityMethod {
+    fn from(m: ShgoConnectivityMethod) -> Self {
+        use crate::shgo::ConnectivityMethod as CM;
+        match m {
+            ShgoConnectivityMethod::Delaunay => CM::Delaunay,
+            ShgoConnectivityMethod::KNearestNeighbors => CM::KNearestNeighbors,
+            ShgoConnectivityMethod::Hnsw => CM::HNSW,
+            ShgoConnectivityMethod::Scann => CM::ScaNN,
+        }
+    }
+}
+
 /// Local optimizer algorithms
 #[repr(C)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -101,7 +127,9 @@ pub struct ShgoOptions_C {
     pub maxfev: usize,
     /// Maximum time in seconds (0.0 = unlimited)
     pub maxtime: f64,
-    /// Function tolerance for local minimization
+    /// Tolerance for the `f_min` precision stopping criterion. Only takes
+    /// effect when a known global minimum is supplied, which the C API does
+    /// not currently expose — inert for now, kept for ABI stability.
     pub f_tol: f64,
     /// Display level (0 = silent, 1 = summary, 2 = detailed)
     pub disp: usize,
@@ -113,6 +141,10 @@ pub struct ShgoOptions_C {
     pub workers: usize,
     /// Whether to perform local minimization every iteration
     pub minimize_every_iter: bool,
+    /// Connectivity method for Sobol-mode sampling graphs
+    pub connectivity_method: ShgoConnectivityMethod,
+    /// Neighbor count for KNN/HNSW/ScaNN connectivity (0 = auto: 2*dim + 1)
+    pub knn_neighbors: usize,
 }
 
 impl Default for ShgoOptions_C {
@@ -122,12 +154,14 @@ impl Default for ShgoOptions_C {
             maxiter: 0,
             maxfev: 0,
             maxtime: 0.0,
-            f_tol: 1e-12,
+            f_tol: 1e-4,
             disp: 0,
             sampling_method: ShgoSamplingMethod::Simplicial,
             local_optimizer: ShgoLocalOptimizer::Bobyqa,
             workers: 0,
             minimize_every_iter: true,
+            connectivity_method: ShgoConnectivityMethod::Delaunay,
+            knn_neighbors: 0,
         }
     }
 }
@@ -149,6 +183,12 @@ impl From<ShgoOptions_C> for ShgoOptions {
             },
             workers: if opts.workers == 0 { None } else { Some(opts.workers) },
             minimize_every_iter: opts.minimize_every_iter,
+            connectivity_method: opts.connectivity_method.into(),
+            knn_neighbors: if opts.knn_neighbors == 0 {
+                None
+            } else {
+                Some(opts.knn_neighbors)
+            },
             ..Default::default()
         }
     }
@@ -192,12 +232,17 @@ pub struct ShgoResult_C {
     pub num_local_minima: usize,
 }
 
+/// Boxed thread-safe objective stored in the handle.
+type BoxedObjective = Box<dyn Fn(&[f64]) -> f64 + Send + Sync>;
+/// Shared constraint stored in the handle (`Arc` so `shgo_minimize` can hand
+/// owned clones to `Shgo::with_constraints`).
+type SharedConstraint = Arc<dyn Fn(&[f64]) -> f64 + Send + Sync>;
+
 /// Opaque handle to a SHGO optimizer instance (not exported to C)
 struct ShgoHandle {
-    objective: Box<dyn Fn(&[f64]) -> f64 + Send + Sync>,
+    objective: BoxedObjective,
     bounds: Vec<(f64, f64)>,
-    /// Arc so `shgo_minimize` can hand owned clones to `Shgo::with_constraints`.
-    constraints: Vec<Arc<dyn Fn(&[f64]) -> f64 + Send + Sync>>,
+    constraints: Vec<SharedConstraint>,
     options: ShgoOptions,
     dim: usize,
 }

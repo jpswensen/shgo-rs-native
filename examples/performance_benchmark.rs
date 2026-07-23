@@ -6,6 +6,7 @@
 //! Build: RUSTFLAGS="-C target-cpu=native" cargo build --example performance_benchmark --release
 //! Run:   ./target/release/examples/performance_benchmark
 
+#![allow(clippy::type_complexity, clippy::too_many_arguments, dead_code)]
 use shgo::{Shgo, ShgoOptions, SamplingMethod, LocalOptimizer, LocalOptimizerOptions};
 use std::time::Instant;
 
@@ -87,7 +88,7 @@ impl BenchResult {
         let mut sorted = self.times_us.clone();
         sorted.sort_by(|a, b| a.partial_cmp(b).unwrap());
         let n = sorted.len();
-        if n % 2 == 0 {
+        if n.is_multiple_of(2) {
             (sorted[n / 2 - 1] + sorted[n / 2]) / 2.0
         } else {
             sorted[n / 2]
@@ -188,7 +189,7 @@ fn bench_constrained<
     for _ in 0..n_runs {
         let f = func.clone();
         let b = bounds.clone();
-        let c: Vec<_> = constraints.iter().cloned().collect();
+        let c: Vec<_> = constraints.to_vec();
         let mut options = ShgoOptions {
             sampling_method,
             iters,

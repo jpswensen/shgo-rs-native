@@ -177,6 +177,9 @@ impl Default for LocalOptimizerOptions {
     }
 }
 
+/// Boxed inequality-constraint function (`g(x) >= 0` means feasible).
+pub type BoxedConstraint = Box<dyn Fn(&[f64]) -> f64>;
+
 /// Result of a local minimization.
 #[derive(Debug, Clone)]
 pub struct LocalOptResult {
@@ -215,8 +218,8 @@ impl LocalOptResult {
 /// * `func` - The objective function to minimize.
 /// * `x0` - Initial guess for the optimization parameters.
 /// * `bounds` - Bounds for each dimension as (lower, upper) pairs.
-/// * `constraints` - Optional inequality constraints where g(x) >= 0 means feasible.
-///                   SHGO uses g(x) >= 0 convention, we convert to NLOPT's g(x) <= 0.
+/// * `constraints` - Optional inequality constraints where g(x) >= 0 means
+///   feasible. SHGO uses g(x) >= 0 convention, we convert to NLOPT's g(x) <= 0.
 /// * `options` - Local optimizer configuration.
 ///
 /// # Returns
@@ -380,7 +383,7 @@ pub fn minimize_local_constrained<F>(
     func: F,
     x0: &[f64],
     bounds: &[(f64, f64)],
-    constraints: &[Box<dyn Fn(&[f64]) -> f64>],
+    constraints: &[BoxedConstraint],
     options: &LocalOptimizerOptions,
 ) -> LocalOptResult
 where

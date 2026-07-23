@@ -13,6 +13,7 @@
 //!   ./target/release/examples/memory_perf_harness --filter "rastrigin"
 //!   ./target/release/examples/memory_perf_harness --quick   # Only small problems
 
+#![allow(clippy::type_complexity, clippy::too_many_arguments, dead_code)]
 #[cfg(feature = "track-alloc")]
 #[global_allocator]
 static ALLOC: shgo::alloc_tracker::TrackingAllocator = shgo::alloc_tracker::TrackingAllocator::new();
@@ -122,7 +123,7 @@ impl BenchResult {
         let mut sorted = self.times_ms.clone();
         sorted.sort_by(|a, b| a.partial_cmp(b).unwrap());
         let n = sorted.len();
-        if n % 2 == 0 {
+        if n.is_multiple_of(2) {
             (sorted[n / 2 - 1] + sorted[n / 2]) / 2.0
         } else {
             sorted[n / 2]
@@ -556,7 +557,7 @@ fn write_json(results: &[BenchResult], path: &str) {
 
 fn main() {
     let args: Vec<String> = std::env::args().collect();
-    let filter = args.iter().find(|a| !a.starts_with("--")).and_then(|_| None::<&str>)
+    let filter = args.iter().find(|a| !a.starts_with("--")).and(None::<&str>)
         .or_else(|| {
             args.iter()
                 .position(|a| a == "--filter")

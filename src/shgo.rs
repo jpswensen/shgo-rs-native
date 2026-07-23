@@ -93,20 +93,17 @@ pub type Bounds = Vec<(f64, f64)>;
 
 /// Sampling method for generating vertices.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Default)]
 pub enum SamplingMethod {
     /// Simplicial sampling using cyclic product triangulation.
     /// Best for low-dimensional problems (n < 10).
+    #[default]
     Simplicial,
     /// Sobol sequence sampling with optional Delaunay triangulation.
     /// Better for high-dimensional problems.
     Sobol,
 }
 
-impl Default for SamplingMethod {
-    fn default() -> Self {
-        SamplingMethod::Simplicial
-    }
-}
 
 /// Method for building vertex connectivity in Sobol mode.
 ///
@@ -114,11 +111,13 @@ impl Default for SamplingMethod {
 /// This affects local minimizer detection (a vertex is a local minimizer if
 /// its function value is less than all its neighbors').
 #[derive(Debug, Clone, Copy, PartialEq)]
+#[derive(Default)]
 pub enum ConnectivityMethod {
     /// Delaunay triangulation via QHull (the default, matching SciPy).
     ///
     /// Produces geometrically correct neighbors but costs O(n^⌈d/2⌉),
     /// making it prohibitively expensive for dimensions > ~7.
+    #[default]
     Delaunay,
 
     /// k-nearest-neighbors connectivity.
@@ -152,11 +151,6 @@ pub enum ConnectivityMethod {
     ScaNN,
 }
 
-impl Default for ConnectivityMethod {
-    fn default() -> Self {
-        ConnectivityMethod::Delaunay
-    }
-}
 
 /// Options for SHGO optimization.
 #[derive(Debug, Clone)]
@@ -796,6 +790,7 @@ where
                 if !candidates.is_empty() {
                     // Pre-compute starting points and locally convex bounds
                     // (reads from Complex which is not modified during minimization)
+                    #[allow(clippy::type_complexity)]
                     let work_items: Vec<(Vec<f64>, Vec<(f64, f64)>)> = candidates
                         .iter()
                         .map(|v| {
@@ -1416,7 +1411,7 @@ where
 
         // ScaNN config tuned for small-to-medium point sets.
         // num_leaves controls partitioning granularity.
-        let num_leaves = (n / 10).max(2).min(1000);
+        let num_leaves = (n / 10).clamp(2, 1000);
         let config = ScaNNConfig {
             num_leaves,
             num_leaves_to_search: num_leaves, // search all leaves for accuracy
@@ -1575,10 +1570,7 @@ where
                     .collect();
 
                 if dim >= 2 && simplex_indices.len() >= dim {
-                    let mut combo = vec![0usize; dim];
-                    for k in 0..dim {
-                        combo[k] = k;
-                    }
+                    let mut combo: Vec<usize> = (0..dim).collect();
                     let n = simplex_indices.len();
                     loop {
                         let pi = simplex_indices[combo[0]];
@@ -1713,7 +1705,7 @@ where
             && local_opts.algorithm.supports_constraints()
         {
             // Build constraint wrappers for NLOPT (g(x) >= 0 convention)
-            let constraint_fns: Vec<Box<dyn Fn(&[f64]) -> f64>> = self
+            let constraint_fns: Vec<crate::local_opt::BoxedConstraint> = self
                 .constraints
                 .iter()
                 .map(|c| {

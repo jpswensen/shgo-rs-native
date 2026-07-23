@@ -241,8 +241,8 @@ where
             c1x.push(Vec::new());
 
             // Copy current containers for iteration
-            let c0x_copy: Vec<Vec<usize>> = c0x[..i].iter().cloned().collect();
-            let c1x_copy: Vec<Vec<usize>> = c1x[..i].iter().cloned().collect();
+            let c0x_copy: Vec<Vec<usize>> = c0x[..i].to_vec();
+            let c1x_copy: Vec<Vec<usize>> = c1x[..i].to_vec();
 
             // Process each pair of lower/upper vertex lists
             for (j, (vl_list, vu_list)) in c0x_copy.iter().zip(c1x_copy.iter()).enumerate() {
@@ -788,7 +788,7 @@ mod tests {
         ];
         for corner in &corners {
             let v = complex.cache.get_or_create(corner.clone());
-            assert!(v.neighbor_indices().len() > 0, "Corner {:?} should have neighbors", corner);
+            assert!(!v.neighbor_indices().is_empty(), "Corner {:?} should have neighbors", corner);
         }
     }
 

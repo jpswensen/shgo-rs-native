@@ -4,3 +4,5 @@
 # macOS AppleDouble junk
 ._*
 .DS_Store
+examples_cpp/example_c
+examples_cpp/example_cpp

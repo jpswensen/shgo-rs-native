@@ -7,7 +7,8 @@
 //! Build: RUSTFLAGS="-C target-cpu=native" cargo build --example parallel_benchmark --release
 //! Run:   ./target/release/examples/parallel_benchmark
 
-use shgo::{Shgo, ShgoOptions, SamplingMethod, LocalOptimizer};
+#![allow(clippy::type_complexity, clippy::too_many_arguments, dead_code)]
+use shgo::{Shgo, ShgoOptions, SamplingMethod};
 use std::sync::Arc;
 use std::time::Instant;
 
@@ -95,7 +96,7 @@ impl BenchResult {
         let mut sorted = self.times_us.clone();
         sorted.sort_by(|a, b| a.partial_cmp(b).unwrap());
         let n = sorted.len();
-        if n % 2 == 0 {
+        if n.is_multiple_of(2) {
             (sorted[n / 2 - 1] + sorted[n / 2]) / 2.0
         } else {
             sorted[n / 2]

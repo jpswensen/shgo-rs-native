@@ -6,12 +6,11 @@
 //! Build: cargo build --example memory_breakdown --release --features track-alloc
 //! Run:   ./target/release/examples/memory_breakdown
 
+#![allow(clippy::type_complexity, clippy::too_many_arguments, dead_code)]
 #[cfg(feature = "track-alloc")]
 #[global_allocator]
 static ALLOC: shgo::alloc_tracker::TrackingAllocator = shgo::alloc_tracker::TrackingAllocator::new();
 
-use shgo::{Shgo, ShgoOptions, SamplingMethod};
-use std::time::Instant;
 
 fn rosenbrock(x: &[f64]) -> f64 {
     x.windows(2)

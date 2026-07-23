@@ -54,6 +54,20 @@ typedef enum ShgoSamplingMethod {
 } ShgoSamplingMethod;
 
 /**
+ * @brief Connectivity methods for Sobol-mode sampling graphs
+ */
+typedef enum ShgoConnectivityMethod {
+    /** Delaunay triangulation via QHull (default, matches SciPy) */
+    SHGO_CONNECTIVITY_DELAUNAY = 0,
+    /** Brute-force k-nearest-neighbors (fast in high dimensions) */
+    SHGO_CONNECTIVITY_KNN = 1,
+    /** HNSW approximate nearest neighbors */
+    SHGO_CONNECTIVITY_HNSW = 2,
+    /** ScaNN approximate nearest neighbors (experimental) */
+    SHGO_CONNECTIVITY_SCANN = 3
+} ShgoConnectivityMethod;
+
+/**
  * @brief Local optimizer algorithms
  */
 typedef enum ShgoLocalOptimizer {
@@ -92,7 +106,8 @@ typedef struct ShgoOptions {
     size_t maxfev;
     /** Maximum time in seconds (0.0 = unlimited) */
     double maxtime;
-    /** Function tolerance for local minimization (default: 1e-12) */
+    /** Tolerance for the f_min precision stopping criterion (inert: the C
+     *  API does not currently expose f_min; kept for ABI stability) */
     double f_tol;
     /** Display level (0 = silent, 1 = summary, 2 = detailed) */
     size_t disp;
@@ -104,6 +119,10 @@ typedef struct ShgoOptions {
     size_t workers;
     /** Whether to perform local minimization every iteration */
     bool minimize_every_iter;
+    /** Connectivity method for Sobol-mode sampling graphs */
+    ShgoConnectivityMethod connectivity_method;
+    /** Neighbor count for KNN/HNSW/ScaNN connectivity (0 = auto: 2*dim + 1) */
+    size_t knn_neighbors;
 } ShgoOptions;
 
 /**

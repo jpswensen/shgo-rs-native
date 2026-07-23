@@ -65,7 +65,7 @@ impl Sobol {
     /// Panics if `dim` is 0 or greater than `DIM_MAX`.
     pub fn new(dim: usize) -> Self {
         assert!(
-            dim >= 1 && dim <= DIM_MAX,
+            (1..=DIM_MAX).contains(&dim),
             "Dimension must be between 1 and {} (got {})",
             DIM_MAX,
             dim
@@ -129,6 +129,7 @@ impl Sobol {
     /// let point = sobol.next();
     /// assert_eq!(point.len(), 2);
     /// ```
+    #[allow(clippy::should_implement_trait)]
     pub fn next(&mut self) -> Vec<f64> {
         let point = self.inner.next()
             .expect("Sobol sequence exhausted");
@@ -245,7 +246,7 @@ mod tests {
         for point in &points {
             assert_eq!(point.len(), 2);
             for &x in point {
-                assert!(x >= 0.0 && x <= 1.0);
+                assert!((0.0..=1.0).contains(&x));
             }
         }
 
@@ -381,16 +382,14 @@ mod tests {
         let mut sobol = Sobol::new(2);
         sobol.reset(0);
 
-        let expected = vec![
-            vec![0.0, 0.0],
+        let expected = [vec![0.0, 0.0],
             vec![0.5, 0.5],
             vec![0.75, 0.25],
             vec![0.25, 0.75],
             vec![0.375, 0.375],
             vec![0.875, 0.875],
             vec![0.625, 0.125],
-            vec![0.125, 0.625],
-        ];
+            vec![0.125, 0.625]];
 
         for (i, exp) in expected.iter().enumerate() {
             let point = sobol.next();
