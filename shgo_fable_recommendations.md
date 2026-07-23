@@ -64,6 +64,23 @@ wasted local evals; rastrigin cases surface additional distinct minima). Timing:
 Sobol+KNN sphere 6-D n=16384 ×2 iters: 2.55 s → **1.22 s** (3.6× vs original baseline).
 Suite: 101 unit + 10 cross-validation + 21 doctests green.
 
+**Simplicial growth control (same session, items 4.3/4.4/4.5):** `Complex::refine(n)`
+now mirrors SciPy's incremental semantics — target = current size + n, reached by a
+bounded initial triangulation and then region-by-region refinement with a vertex
+budget; a region interrupted mid-refinement resumes by an idempotent re-walk
+(replacing SciPy's generator suspension). `iterate_simplicial` no longer triangulates
+before the loop or runs `refine_all` per iteration: every iteration adds ~n = 2^dim+1
+points. Validated against per-iteration probes of scipy 1.18 (`SHGO.iterate()` driven
+directly: 2-D V.size 5→10→15→20; 9-D 513/iter): the Rust default 9-D run now samples
+**exactly 513** points (was 20,195 — a 39× oversampling), benchmark time 0.51 s →
+0.032 s, and 2-D 4-iteration growth is 20 sampling evals, matching SciPy. Two parity
+tests pin this (`test_simplicial_default_samples_initial_complex_only`,
+`test_simplicial_linear_growth_per_iteration`). Discovery along the way: **SciPy's
+reported `res.nfev` is buggy in multi-iteration simplicial runs** — it reports a stale
+`fn` (e.g. 8 when 17 unique evaluations actually occurred, verified by counting calls);
+Rust reports true counts, so do NOT chase parity against SciPy's reported number.
+Suite: 103 unit + 10 cross-validation + 21 doctests green.
+
 ## 1. The KNN / connectivity work: exists on GitHub since April 2026
 
 Commit `157e8fd` ("Add 4 connectivity methods for Sobol mode + performance
@@ -202,9 +219,9 @@ returning it from the iterate functions or hoisting the cache).
 |---|---|---|---|
 | 4.1 | ~~`maxev` compares against function evaluations instead of sampled points~~ **FIXED (2026-07-22)** | — | SciPy checks `n_sampled >= maxev` (sampling points incl. infeasible); Rust reuses `fev_count`, making `maxev` a duplicate of `maxfev`. Fix: track points generated / vertex-cache size. |
 | 4.2 | Sobol mode builds connectivity over only the new batch — **fixed for KNN/HNSW/ScaNN (2026-07-22); Delaunay still per-batch (P2)** | src/shgo.rs:995–1060 | SciPy accumulates all points in `self.C` and re/incrementally triangulates the whole cloud (`Tri.add_points`), so old vertices gain new neighbors and stale minimizers get disqualified. Rust leaves old vertices with stale neighborhoods and never connects old↔new; the new KNN/HNSW/ScaNN builders inherit the same per-batch scope. Single-iteration runs are unaffected; multi-iteration runs produce extra local-minimization candidates (LMC dedup keeps this cheap, but it deviates from SciPy). For KNN this is trivially fixable: build the graph over *all* cached vertices each iteration. |
-| 4.3 | Default simplicial iteration refines the whole complex | src/shgo.rs:766–772, src/complex.rs:410–444 | With default `n=0`, every iteration calls `refine_all` → super-exponential vertex growth (≈3^dim per generation). SciPy's default resolves `n = 2^dim + 1` and calls `refine(n)`, adding ~n targeted points per iteration (linear growth). Combined with 3.1 this is the other half of the scaling wall. |
-| 4.4 | `Complex::refine(Some(n))` overshoots; `cyclic_product_limited` ignores its limit | src/complex.rs:337–344, 410–425 | `refine(n)` loops `refine_all` until `len ≥ target` (can add thousands for n=5); the initial triangulation always builds all 2^dim corners regardless of `n` (1M vertices at dim=20 before refinement starts). SciPy's `Complex.triangulate(n)`/`refine(n)` are incremental and bounded. This makes simplicial mode unusable beyond dim ≈ 15 even for tiny n. |
-| 4.5 | One extra refinement generation in every simplicial run — **quantified vs SciPy 1.18**: 9-D sphere simplicial defaults → SciPy `nfev = 523` (513 sampling + 10 local) vs Rust `nfev = 20236` (~39× oversampling); also SciPy's `maxiter=3` 2-D run adds NO new sampling after iteration 1 (`nfev = 8`, `nit = 3`) — understand that mechanism in `_complex.py` before porting | src/shgo.rs:754–772 | Rust triangulates *before* the loop and refines *inside* iteration 1; SciPy's first iteration is the initial triangulation only. Default `iters=1` therefore samples ~3^dim points where SciPy samples 2^dim+1 — different nfev, different minimizer pool. The cross-validation suite doesn't catch it because there is no end-to-end fixture (see §7). |
+| 4.3 | ~~Default simplicial iteration refines the whole complex~~ **FIXED (2026-07-22)**: every iteration adds ~n = 2^dim+1 points via budgeted incremental refinement | — | With default `n=0`, every iteration calls `refine_all` → super-exponential vertex growth (≈3^dim per generation). SciPy's default resolves `n = 2^dim + 1` and calls `refine(n)`, adding ~n targeted points per iteration (linear growth). Combined with 3.1 this is the other half of the scaling wall. |
+| 4.4 | **Mostly fixed (2026-07-22)**: `refine(Some(n))` is now budgeted (+n per call). Remaining: `cyclic_product_limited` still builds the full 2^dim initial product, so requesting n < 2^dim+1 initial vertices overshoots iteration 1 (SciPy stops mid-product via a resumable generator) — matters only above dim ≈ 15–20 | src/complex.rs | `refine(n)` loops `refine_all` until `len ≥ target` (can add thousands for n=5); the initial triangulation always builds all 2^dim corners regardless of `n` (1M vertices at dim=20 before refinement starts). SciPy's `Complex.triangulate(n)`/`refine(n)` are incremental and bounded. This makes simplicial mode unusable beyond dim ≈ 15 even for tiny n. |
+| 4.5 | ~~One extra refinement generation in every simplicial run~~ **FIXED (2026-07-22)**: iteration 1 = bounded initial triangulation only; Rust 9-D default now samples exactly 513 points like SciPy. (The earlier "SciPy adds no sampling after iteration 1" reading was an artifact of SciPy's stale-`fn` nfev reporting bug — actual SciPy growth is +n per iteration, which Rust now matches.) | — | Rust triangulates *before* the loop and refines *inside* iteration 1; SciPy's first iteration is the initial triangulation only. Default `iters=1` therefore samples ~3^dim points where SciPy samples 2^dim+1 — different nfev, different minimizer pool. The cross-validation suite doesn't catch it because there is no end-to-end fixture (see §7). |
 | 4.6 | `maxiter_local` truncates an unsorted pool | src/shgo.rs:802, 1072 | SciPy sorts the minimizer pool by function value (`sort_min_pool`) before trimming; Rust `.take(maxiter_local)` grabs insertion-order candidates. Fix: sort candidates by vertex f before `take`. (Abandoning `g_topograph` distance ordering for the parallel pool is fine — order no longer affects results because all candidates run — but *which* candidates survive truncation should match.) |
 | 4.7 | Unconverged local results counted as successes | src/local_opt.rs:341, 501 | NLopt `MaxevalReached`/`MaxtimeReached` return `Ok` → `success: true`, so unconverged points enter `xl`. SciPy filters on `lres.success`. Consider mapping maxeval/maxtime termination to `success=false` (or a separate flag) to match. |
 | 4.8 | Dead options: `symmetry`, `min_feasible_ratio`, `infty_constraints` | src/shgo.rs:200–278 | Declared, documented in README, never read. Worse, `symmetry` defaults to `true` while SciPy defaults symmetry *off* — a user reading the README expects an active feature. `infty_constraints` is hardcoded as `1e50` in `process_bounds`. Either implement or delete the fields; deleting is honest. |
@@ -336,7 +353,7 @@ Recommended additions, in order of value:
 | ~~P1~~ ✅ | 6. parallelize the brute-force KNN loop (rayon over rows) | done |
 | ~~P1~~ ✅ | 6/4.2 build ANN graphs over all cached vertices (cumulative) | done |
 | ~~P1~~ ✅ | 3.4 nfev accounting; 4.1 maxev semantics | done |
-| P1 | 4.3/4.4/4.5 simplicial growth control (`refine(n)` bounded, no extra generation) | ~1 day |
+| ~~P1~~ ✅ | 4.3/4.4/4.5 simplicial growth control (budgeted refine, SciPy-parity growth) — residual: mid-product initial triangulation for n < 2^dim+1 | done |
 | P2 | 4.2 cumulative/incremental Delaunay per iteration | ~0.5 day |
 | P2 | 4.6 sort pool before `maxiter_local`; 4.7 success semantics; 4.8 delete dead options | ~2 h |
 | P2 | 7. end-to-end SciPy fixtures + fixture-generation setup | ~0.5 day |

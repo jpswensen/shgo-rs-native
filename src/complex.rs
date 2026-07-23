@@ -335,9 +335,14 @@ where
     }
 
     /// Limited cyclic product triangulation (up to n vertices).
+    ///
+    /// Remaining approximation vs SciPy: SciPy's cyclic product is a
+    /// resumable generator that can stop mid-product, so `n < 2^dim + 1`
+    /// yields a partial initial complex. Here the initial product is built
+    /// in full once the cache is below the target, overshooting only when
+    /// the caller asks for fewer than 2^dim + 1 initial vertices (rare and
+    /// documented in the audit as the open part of item 4.4).
     fn cyclic_product_limited(&mut self, max_vertices: usize, centroid: bool) {
-        // For now, just do full triangulation if we have room
-        // A more sophisticated implementation would stop mid-way
         if self.cache.len() < max_vertices {
             self.cyclic_product_full(centroid);
         }
@@ -399,27 +404,62 @@ where
         midpoint
     }
 
-    /// Refine the complex by adding n new vertices.
+    /// Refine the complex by adding approximately `n` new vertices.
     ///
-    /// If initial triangulation hasn't been performed, it will be
-    /// started first.
+    /// Mirrors SciPy's `Complex.refine(n)` growth semantics: the target is
+    /// `current_size + n`, reached by (a) completing the initial
+    /// triangulation if needed, then (b) refining regions from the
+    /// `triangulated_vectors` queue one at a time, stopping as soon as the
+    /// target is met. A region interrupted mid-refinement stays at the queue
+    /// head and is resumed on the next call by re-walking it — all split and
+    /// connect operations are memoized/idempotent, so the re-walk only pays
+    /// cheap lookups before continuing where it left off. (SciPy suspends a
+    /// generator instead; the observable per-iteration growth is the same,
+    /// though the sub-region bookkeeping of a resumed region can differ
+    /// slightly since our `sup_set` snapshot is retaken on resume.)
     ///
     /// # Arguments
     ///
-    /// * `n` - Number of vertices to add (or None to refine all)
+    /// * `n` - Number of vertices to add (or None to refine all regions once)
     pub fn refine(&mut self, n: Option<usize>) {
         match n {
             None => self.refine_all(true),
             Some(count) => {
                 let target = self.cache.len() + count;
-                if !self.triangulated {
-                    self.triangulate(Some(target), true);
+                // Guard against floating-point exhaustion: if a full cycle
+                // through the region queue creates no new vertices (midpoints
+                // bitwise-equal to endpoints), stop rather than spin.
+                let mut stalled = 0usize;
+                while self.cache.len() < target {
+                    if !self.triangulated {
+                        self.triangulate(Some(target), true);
+                        continue;
+                    }
+                    if self.triangulated_vectors.is_empty() {
+                        break;
+                    }
+                    let before = self.cache.len();
+                    let (origin, supremum) = self.triangulated_vectors[0].clone();
+                    match self.refine_local_space_budgeted(&origin, &supremum, true, target) {
+                        Some(sub_regions) => {
+                            self.triangulated_vectors.remove(0);
+                            self.triangulated_vectors.extend(sub_regions);
+                        }
+                        None => {
+                            // Budget hit mid-region; region stays queued for
+                            // an idempotent resume on the next call.
+                        }
+                    }
+                    if self.cache.len() == before {
+                        stalled += 1;
+                        if stalled > self.triangulated_vectors.len().max(4) {
+                            break;
+                        }
+                    } else {
+                        stalled = 0;
+                    }
                 }
-                // Additional refinement logic would go here
-                // For now, just ensure we have enough vertices
-                while self.cache.len() < target && !self.triangulated_vectors.is_empty() {
-                    self.refine_all(true);
-                }
+                self.generation += 1;
             }
         }
     }
@@ -435,7 +475,9 @@ where
         let mut new_regions = Vec::new();
 
         for (origin, supremum) in regions {
-            let sub_regions = self.refine_local_space(&origin, &supremum, centroids);
+            let sub_regions = self
+                .refine_local_space_budgeted(&origin, &supremum, centroids, usize::MAX)
+                .expect("unbudgeted refine cannot pause");
             new_regions.extend(sub_regions);
         }
 
@@ -443,25 +485,32 @@ where
         self.generation += 1;
     }
 
-    /// Refine a local region of the complex using C3 cyclic group products.
+    /// Refine a local region of the complex using C3 cyclic group products,
+    /// stopping early once the vertex cache reaches `target` vertices.
     ///
-    /// This is a faithful port of the Python `refine_local_space` method.
-    /// It performs the following:
+    /// This is a port of the Python `refine_local_space` generator. It:
     /// 1. Splits the region diagonal to create/find the centroid
     /// 2. Takes a snapshot of the centroid's neighbors within the region (sup_set)
     /// 3. Creates C3 group product vertices across all dimensions
     /// 4. Optionally creates sub-region centroids
     /// 5. Returns sub-regions as (centroid, sup_set_vertex) pairs
     ///
+    /// The vertex budget replaces Python's generator suspension: when the
+    /// cache reaches `target` mid-region, we return `None` and the caller
+    /// re-invokes later — every split/connect here is memoized/idempotent, so
+    /// the re-walk skips existing work and continues where it stopped.
+    ///
     /// # Returns
     ///
-    /// New sub-regions that replace the input region.
-    fn refine_local_space(
+    /// `Some(sub_regions)` when the region completed (caller replaces the
+    /// region with these), `None` when paused on the vertex budget.
+    fn refine_local_space_budgeted(
         &self,
         origin: &[f64],
         supremum: &[f64],
         centroid: bool,
-    ) -> Vec<(Vec<f64>, Vec<f64>)> {
+        target: usize,
+    ) -> Option<Vec<(Vec<f64>, Vec<f64>)>> {
         // Ensure origin <= supremum component-wise
         let mut s_origin = origin.to_vec();
         let mut s_supremum = supremum.to_vec();
@@ -505,6 +554,10 @@ where
         let c_v = self.cache.get_or_create(c_v_coords.as_slice().to_vec());
         c_v.connect(vco.index());
         vco.connect(c_v.index());
+
+        if self.cache.len() >= target {
+            return None;
+        }
 
         // Track C3 groups as (lower_coords, center_coords, upper_coords)
         let mut groups: Vec<(Vec<f64>, Vec<f64>, Vec<f64>)> = vec![(
@@ -592,6 +645,10 @@ where
                     c_vu_coords.as_slice().to_vec(),
                     a_upper.clone(),
                 ));
+
+                if self.cache.len() >= target {
+                    return None;
+                }
             }
 
             groups = new_groups;
@@ -612,15 +669,21 @@ where
                         neighbor.connect(sub_centroid.index());
                     }
                 }
+
+                if self.cache.len() >= target {
+                    return None;
+                }
             }
         }
 
         // Return sub-regions: (centroid, each_neighbor_in_region)
         let vco_vec = vco_coords.as_slice().to_vec();
-        sup_set
-            .into_iter()
-            .map(|sup_v| (vco_vec.clone(), sup_v))
-            .collect()
+        Some(
+            sup_set
+                .into_iter()
+                .map(|sup_v| (vco_vec.clone(), sup_v))
+                .collect(),
+        )
     }
 
     /// Process all pending field evaluations.

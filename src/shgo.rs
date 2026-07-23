@@ -753,25 +753,21 @@ where
             wrapped_constraints,
         );
 
-        // Initial triangulation (with centroid, matching Python)
-        complex.triangulate(None, true);
-        complex.process_pools();
-
         let effective_n = self.effective_n();
         let effective_iters = self.effective_iters();
         let mut iteration = 0;
 
-        // Main optimization loop
+        // Main optimization loop. Matches SciPy's iterate_hypercube growth:
+        // every iteration adds ~n new sampling points (auto n = 2^dim + 1).
+        // Iteration 1's refine performs the bounded initial triangulation, so
+        // the default single-iteration run samples exactly the initial
+        // complex (2^dim corners + centroid) like SciPy — no extra
+        // refinement generation.
         loop {
             iteration += 1;
             result.nit = iteration;
 
-            // Refine the complex (with centroids, matching Python)
-            if effective_n == 0 || self.options.n == 0 {
-                complex.refine_all(true);
-            } else {
-                complex.refine(Some(effective_n));
-            }
+            complex.refine(Some(effective_n));
             complex.process_pools();
 
             // Find local minimizer candidates
@@ -2257,6 +2253,47 @@ mod tests {
 
         // Verify the optimizer stopped (didn't run all 100 iterations)
         assert!(result.nit < 100);
+    }
+
+    #[test]
+    fn test_simplicial_default_samples_initial_complex_only() {
+        // SciPy parity: a default simplicial run (iters = 1) samples exactly
+        // the initial complex — 2^dim corners + centroid — with no extra
+        // refinement generation (scipy 1.18 probe: 513 evals in 9-D).
+        let bounds = vec![(-5.0, 5.0); 9];
+        let result = Shgo::new(sphere, bounds)
+            .with_options(ShgoOptions::default())
+            .minimize()
+            .unwrap();
+
+        let sampling_evals = result.nfev - result.nlfev;
+        assert_eq!(sampling_evals, (1 << 9) + 1, "expected 513 sampling evals");
+        assert_eq!(result.nit, 1);
+        assert!(result.fun < 1e-8);
+    }
+
+    #[test]
+    fn test_simplicial_linear_growth_per_iteration() {
+        // SciPy parity: each iteration adds ~n = 2^dim + 1 new sampling
+        // points (scipy 1.18 probe: 2-D V.size 5 -> 10 -> 15 -> 20 over 4
+        // iterations), not a full refinement generation.
+        let bounds = vec![(-5.0, 5.0); 2];
+        let options = ShgoOptions {
+            maxiter: Some(4),
+            ..Default::default()
+        };
+        let result = Shgo::new(sphere, bounds)
+            .with_options(options)
+            .minimize()
+            .unwrap();
+
+        let sampling_evals = result.nfev - result.nlfev;
+        assert_eq!(result.nit, 4);
+        assert!(
+            (20..=26).contains(&sampling_evals),
+            "expected ~20 sampling evals (5/iter x 4 iters), got {}",
+            sampling_evals
+        );
     }
 
     #[test]

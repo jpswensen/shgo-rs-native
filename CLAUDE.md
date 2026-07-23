@@ -48,10 +48,18 @@ pool sized by `options.workers` (None = all cores, `Some(1)` = serial/determinis
 dispatches on `SamplingMethod`:
 
 - **Simplicial** (default): builds a `Complex` (src/complex.rs) via cyclic-product
-  triangulation of the hyperrectangle (2^dim corners + centroid), then refines each
-  iteration with C3 cyclic-group edge splitting (`refine_local_space`, a port of Python's
-  method of the same name). Local minimizations use locally-convex bounds tightened by
-  neighbor positions (`construct_lcb_simplicial`, exact port of SciPy's).
+  triangulation of the hyperrectangle (2^dim corners + centroid) and grows it with
+  SciPy-parity semantics: every iteration adds ~n = 2^dim+1 new vertices
+  (`Complex::refine(Some(n))` — bounded initial triangulation on iteration 1, then
+  region-by-region C3 refinement (`refine_local_space_budgeted`) with a vertex budget;
+  an interrupted region resumes via idempotent re-walk, mirroring SciPy's generator
+  suspension). Growth parity vs scipy 1.18 is pinned by
+  `test_simplicial_default_samples_initial_complex_only` and
+  `test_simplicial_linear_growth_per_iteration` — keep those green when touching
+  refinement. Beware: SciPy's *reported* `res.nfev` under-counts in multi-iteration
+  simplicial runs (stale `fn`); compare against actual evaluation counts, not SciPy's
+  report. Local minimizations use locally-convex bounds tightened by neighbor
+  positions (`construct_lcb_simplicial`, exact port of SciPy's).
 - **Sobol**: draws Joe-Kuo Sobol points (src/sobol.rs, via `sobol-qmc`, bit-exact vs
   `scipy.stats.qmc.Sobol` unscrambled — verified by fixtures), rounds n up to a power of 2,
   then builds vertex connectivity per `options.connectivity_method`
