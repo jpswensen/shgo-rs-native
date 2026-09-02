@@ -340,6 +340,18 @@ pub struct ShgoOptions {
     /// SciPy parity (its `minimizers()` skips these vertices). Default:
     /// `false`.
     pub explore_from_known_minima: bool,
+
+    /// After optimization, measure each retained minimum's sensitivity to
+    /// parameter perturbations on a deterministic stencil. See
+    /// [`RobustnessProbe`]. Results in [`ShgoResult::robustness`]; the
+    /// evaluations are added to `nfev`. Default: `None`.
+    pub robustness_probe: Option<RobustnessProbe>,
+
+    /// After optimization (and the probe, if any), re-optimize the best minima
+    /// on the stencil-smoothed objective. See [`RobustPolish`]. Results in
+    /// [`ShgoResult::robust_minima`]; the evaluations are added to `nfev`.
+    /// Default: `None`.
+    pub robust_polish: Option<RobustPolish>,
 }
 
 /// Budget-driven automatic choice of the k-nearest-neighbour count.
@@ -385,6 +397,170 @@ pub struct KnnSelection {
     pub curve: Vec<usize>,
 }
 
+/// How the objective values over a perturbation stencil are collapsed into one
+/// number (the "robust value" of a point).
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum RobustAggregate {
+    /// Mean over the stencil: the expected value under a uniform perturbation.
+    Mean,
+    /// Worst case over the stencil.
+    Max,
+    /// Mean of the worst `fraction` of the stencil (CVaR-style; `fraction` in
+    /// `(0, 1]`, e.g. `0.25` = mean of the worst quarter).
+    Cvar { fraction: f64 },
+}
+
+/// A deterministic perturbation stencil around a point: the point itself, the
+/// `2·dim` axis steps `x ± radius_i·e_i`, and `samples` Sobol points in the box
+/// `[x − radius, x + radius]`, all clipped to the bounds. `radius_i` is
+/// `radius_rel` times the width of dimension `i`'s bounds (`max(1, |x_i|)`
+/// when that width is effectively infinite).
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct Stencil {
+    /// Half-width per dimension, as a fraction of that dimension's bounds width.
+    pub radius_rel: f64,
+    /// Include the `2·dim` axis steps.
+    pub axis_steps: bool,
+    /// Number of Sobol points in the perturbation box (0 = none).
+    pub samples: usize,
+}
+
+impl Stencil {
+    /// Axis steps only, at the given relative radius.
+    pub fn axes(radius_rel: f64) -> Self {
+        Self {
+            radius_rel,
+            axis_steps: true,
+            samples: 0,
+        }
+    }
+
+    /// Axis steps plus `samples` Sobol points.
+    pub fn with_samples(radius_rel: f64, samples: usize) -> Self {
+        Self {
+            radius_rel,
+            axis_steps: true,
+            samples,
+        }
+    }
+}
+
+/// Measure how sensitive each polished minimum is to small parameter
+/// perturbations, after the optimization has finished.
+///
+/// For every retained minimum (or the `top` lowest), the objective is evaluated
+/// on a [`Stencil`] around it and summarised in a [`RobustnessStats`]. This is
+/// a *polished-point* measurement, complementary to the sampled-cloud
+/// [`BasinStats`]: at typical sampling densities a basin has few, distant
+/// members, whereas the stencil sits exactly where the answer is. Costs the
+/// stencil size in objective evaluations per probed minimum and nothing else.
+/// Extension — SciPy has no equivalent.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct RobustnessProbe {
+    /// The perturbation stencil.
+    pub stencil: Stencil,
+    /// Aggregate reported as [`RobustnessStats::robust_value`].
+    pub aggregate: RobustAggregate,
+    /// Probe only the `top` minima with the lowest `funl` (`None` = all).
+    pub top: Option<usize>,
+}
+
+impl RobustnessProbe {
+    /// Axis steps plus `samples` Sobol points at `radius_rel`, mean aggregate,
+    /// all minima.
+    pub fn new(radius_rel: f64, samples: usize) -> Self {
+        Self {
+            stencil: Stencil::with_samples(radius_rel, samples),
+            aggregate: RobustAggregate::Mean,
+            top: None,
+        }
+    }
+}
+
+/// Re-optimize the best minima on the *smoothed* objective — the
+/// [`RobustAggregate`] of the objective over a [`Stencil`] around each trial
+/// point — so the answer moves to the centre of a flat region rather than to
+/// the bottom of a sharp one.
+///
+/// Every evaluation of the smoothed objective costs the stencil size in raw
+/// evaluations, so this is applied to the `top` minima only, ranked by the
+/// probe's robust value when [`ShgoOptions::robustness_probe`] is set and by
+/// `funl` otherwise. The raw `xl`/`funl`/`x`/`fun` are left untouched; the
+/// robust results are reported separately in [`ShgoResult::robust_minima`].
+/// Extension — SciPy has no equivalent.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct RobustPolish {
+    /// The perturbation stencil used inside the smoothed objective.
+    pub stencil: Stencil,
+    /// How the stencil values are aggregated into the smoothed objective.
+    pub aggregate: RobustAggregate,
+    /// Number of minima to re-optimize.
+    pub top: usize,
+    /// Cap on evaluations of the *smoothed* objective per minimum (each costs
+    /// the stencil size in raw evaluations). `None` = the local optimizer's
+    /// own `maxeval`.
+    pub maxeval: Option<u32>,
+}
+
+impl RobustPolish {
+    /// Robust-polish the `top` minima with axis steps plus `samples` Sobol
+    /// points at `radius_rel`, mean aggregate.
+    pub fn new(radius_rel: f64, samples: usize, top: usize) -> Self {
+        Self {
+            stencil: Stencil::with_samples(radius_rel, samples),
+            aggregate: RobustAggregate::Mean,
+            top,
+            maxeval: None,
+        }
+    }
+}
+
+/// Sensitivity of one polished minimum to parameter perturbations (see
+/// [`RobustnessProbe`]).
+#[derive(Debug, Clone)]
+pub struct RobustnessStats {
+    /// Row of `xl` / `funl` this describes.
+    pub xl_index: usize,
+    /// The minimum's own objective value (`funl[xl_index]`).
+    pub f_center: f64,
+    /// The requested aggregate over the feasible stencil points (including
+    /// the centre). Lower is more robust for a minimization.
+    pub robust_value: f64,
+    /// Mean over the feasible stencil points.
+    pub f_mean: f64,
+    /// Median over the feasible stencil points.
+    pub f_median: f64,
+    /// Best and worst feasible stencil values.
+    pub f_min: f64,
+    pub f_max: f64,
+    /// Standard deviation over the feasible stencil points.
+    pub f_std: f64,
+    /// Dimension whose axis step produced the largest increase over
+    /// `f_center` (`None` without axis steps or if nothing increased).
+    pub worst_axis: Option<usize>,
+    /// Stencil points evaluated / skipped as infeasible (constraint violation,
+    /// non-finite objective, or clipped onto the centre itself).
+    pub n_feasible: usize,
+    pub n_infeasible: usize,
+}
+
+/// One minimum re-optimized on the smoothed objective (see [`RobustPolish`]).
+#[derive(Debug, Clone)]
+pub struct RobustMinimum {
+    /// Row of `xl` this started from.
+    pub xl_index: usize,
+    /// Location of the robust optimum.
+    pub x: Vec<f64>,
+    /// Smoothed objective (the configured aggregate) at `x`.
+    pub robust_value: f64,
+    /// Raw objective at `x`.
+    pub f_center: f64,
+    /// Raw objective evaluations spent on this minimum.
+    pub nfev: usize,
+    /// Whether the local optimizer reported convergence.
+    pub success: bool,
+}
+
 impl Default for ShgoOptions {
     fn default() -> Self {
         Self {
@@ -418,6 +594,8 @@ impl Default for ShgoOptions {
             min_candidate_persistence: None,
             max_candidates_by_persistence: None,
             explore_from_known_minima: false,
+            robustness_probe: None,
+            robust_polish: None,
         }
     }
 }
@@ -504,6 +682,13 @@ pub struct ShgoResult {
     /// it was chosen from, for the most recent iteration. `None` when
     /// automatic selection was not used.
     pub knn_selection: Option<KnnSelection>,
+    /// Perturbation sensitivity of the probed minima, in `xl` order (only when
+    /// [`ShgoOptions::robustness_probe`] is set).
+    pub robustness: Option<Vec<RobustnessStats>>,
+    /// Minima re-optimized on the smoothed objective (only when
+    /// [`ShgoOptions::robust_polish`] is set), sorted ascending by
+    /// `robust_value`.
+    pub robust_minima: Option<Vec<RobustMinimum>>,
 }
 
 impl ShgoResult {
@@ -522,6 +707,8 @@ impl ShgoResult {
             time: 0.0,
             basins: None,
             knn_selection: None,
+            robustness: None,
+            robust_minima: None,
         }
     }
 }
@@ -670,6 +857,28 @@ where
         .collect();
     let finite: Vec<bool> = fs.iter().map(|f| f.is_finite()).collect();
     compute_persistence(&vertices, &fs, &finite)
+}
+
+/// Stencil points tagged with their axis (for axis steps), plus the number of
+/// points that clipped onto the centre and were dropped.
+type StencilPoints = (Vec<(Vec<f64>, Option<usize>)>, usize);
+
+/// Collapse stencil values into the robust value (see [`RobustAggregate`]).
+/// Empty input (no feasible stencil point) is `+inf`.
+fn robust_aggregate(values: &[f64], agg: RobustAggregate) -> f64 {
+    if values.is_empty() {
+        return f64::INFINITY;
+    }
+    match agg {
+        RobustAggregate::Mean => values.iter().sum::<f64>() / values.len() as f64,
+        RobustAggregate::Max => values.iter().cloned().fold(f64::NEG_INFINITY, f64::max),
+        RobustAggregate::Cvar { fraction } => {
+            let mut v = values.to_vec();
+            v.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+            let n = ((v.len() as f64 * fraction.clamp(0.0, 1.0)).ceil() as usize).clamp(1, v.len());
+            v[v.len() - n..].iter().sum::<f64>() / n as f64
+        }
+    }
 }
 
 /// Compute per-basin statistics over an evaluated vertex cache.
@@ -1229,6 +1438,17 @@ where
                     let key = b.x_polished.as_ref().unwrap_or(&b.x_sampled);
                     b.xl_index = xl.iter().position(|x| self.within_x_tolerance(x, key));
                 }
+            }
+        }
+
+        // Post-optimization robustness analysis (extensions; both add their
+        // objective evaluations to nfev and leave x/fun/xl/funl untouched).
+        if !result.xl.is_empty() {
+            if let Some(probe) = self.options.robustness_probe {
+                result.nfev += self.probe_robustness(&mut result, &probe);
+            }
+            if let Some(rp) = self.options.robust_polish {
+                result.nfev += self.robust_polish(&mut result, &rp);
             }
         }
 
@@ -2513,6 +2733,262 @@ where
         Some(local_min)
     }
 
+    /// Per-dimension perturbation radii: `radius_rel` times the bounds width
+    /// (`max(1, |x_i|)` for an effectively unbounded dimension).
+    fn stencil_radii(&self, center: &[f64], radius_rel: f64) -> Vec<f64> {
+        center
+            .iter()
+            .zip(self.bounds.iter())
+            .map(|(x, (lo, hi))| {
+                let width = hi - lo;
+                let scale = if width.is_finite() && width < 1e30 {
+                    width
+                } else {
+                    x.abs().max(1.0)
+                };
+                radius_rel * scale
+            })
+            .collect()
+    }
+
+    /// The stencil points around `center`, clipped to the bounds: optionally
+    /// the centre itself, then the axis steps (tagged with their dimension),
+    /// then the Sobol points. Points that clip onto the centre (a minimum on
+    /// a bound) are dropped; the count of dropped points is returned too.
+    fn stencil_points(&self, center: &[f64], st: &Stencil, include_center: bool) -> StencilPoints {
+        let dim = center.len();
+        let r = self.stencil_radii(center, st.radius_rel);
+        let clip = |v: Vec<f64>| -> Vec<f64> {
+            v.into_iter()
+                .zip(self.bounds.iter())
+                .map(|(x, (lo, hi))| x.clamp(*lo, *hi))
+                .collect()
+        };
+        let mut pts: Vec<(Vec<f64>, Option<usize>)> = Vec::new();
+        let mut dropped = 0usize;
+        if include_center {
+            pts.push((center.to_vec(), None));
+        }
+        if st.axis_steps {
+            for i in 0..dim {
+                for sign in [1.0, -1.0] {
+                    let mut p = center.to_vec();
+                    p[i] += sign * r[i];
+                    let p = clip(p);
+                    if p == center {
+                        dropped += 1;
+                    } else {
+                        pts.push((p, Some(i)));
+                    }
+                }
+            }
+        }
+        if st.samples > 0 {
+            // Skip the first two Sobol points: index 0 is the box corner and
+            // index 1 is the box centre, i.e. `center` itself.
+            let mut sobol = Sobol::new(dim);
+            for u in sobol.generate(st.samples, 2) {
+                let p: Vec<f64> = u
+                    .iter()
+                    .zip(center.iter())
+                    .zip(r.iter())
+                    .map(|((ui, x), ri)| x + (2.0 * ui - 1.0) * ri)
+                    .collect();
+                let p = clip(p);
+                if p == center {
+                    dropped += 1;
+                } else {
+                    pts.push((p, None));
+                }
+            }
+        }
+        (pts, dropped)
+    }
+
+    /// Evaluate the objective at `points` in parallel. `None` marks a point
+    /// that violates a constraint (not evaluated) or returned a non-finite
+    /// value. Also returns the number of objective calls made.
+    fn evaluate_points(&self, points: &[Vec<f64>]) -> (Vec<Option<f64>>, usize) {
+        let func = &self.func;
+        let cons = &self.constraints;
+        let calls = AtomicUsize::new(0);
+        let values: Vec<Option<f64>> = points
+            .par_iter()
+            .map(|p| {
+                // NaN counts as a violation, as in the sampling path.
+                if cons.iter().any(|g| {
+                    let v = g(p);
+                    v.is_nan() || v < 0.0
+                }) {
+                    return None;
+                }
+                calls.fetch_add(1, Ordering::Relaxed);
+                let f = func(p);
+                if f.is_finite() {
+                    Some(f)
+                } else {
+                    None
+                }
+            })
+            .collect();
+        (values, calls.load(Ordering::Relaxed))
+    }
+
+    /// [`ShgoOptions::robustness_probe`]: evaluate a stencil around each of the
+    /// probed minima and summarise it. `result.xl` must already be sorted
+    /// ascending by `funl`. Returns the number of objective evaluations made.
+    fn probe_robustness(&self, result: &mut ShgoResult, probe: &RobustnessProbe) -> usize {
+        let m = probe
+            .top
+            .map(|t| t.min(result.xl.len()))
+            .unwrap_or(result.xl.len());
+        let mut all_points: Vec<Vec<f64>> = Vec::new();
+        let mut meta: Vec<(usize, Option<usize>)> = Vec::new();
+        let mut dropped = vec![0usize; m];
+        for (i, d) in dropped.iter_mut().enumerate() {
+            let (pts, dr) = self.stencil_points(&result.xl[i], &probe.stencil, false);
+            *d = dr;
+            for (p, axis) in pts {
+                all_points.push(p);
+                meta.push((i, axis));
+            }
+        }
+        let (values, n_calls) = self.evaluate_points(&all_points);
+
+        let mut stats = Vec::with_capacity(m);
+        for (i, &dr) in dropped.iter().enumerate() {
+            let f_center = result.funl[i];
+            let mut feasible: Vec<f64> = vec![f_center];
+            let mut n_infeasible = dr;
+            let mut worst_axis: Option<(usize, f64)> = None;
+            for (k, (xi, axis)) in meta.iter().enumerate() {
+                if *xi != i {
+                    continue;
+                }
+                match values[k] {
+                    Some(f) => {
+                        feasible.push(f);
+                        if let Some(a) = axis {
+                            let inc = f - f_center;
+                            if inc > 0.0 && worst_axis.is_none_or(|(_, w)| inc > w) {
+                                worst_axis = Some((*a, inc));
+                            }
+                        }
+                    }
+                    None => n_infeasible += 1,
+                }
+            }
+            let n = feasible.len();
+            let f_mean = feasible.iter().sum::<f64>() / n as f64;
+            let f_std = (feasible.iter().map(|f| (f - f_mean).powi(2)).sum::<f64>() / n as f64).sqrt();
+            let mut sorted = feasible.clone();
+            sorted.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+            stats.push(RobustnessStats {
+                xl_index: i,
+                f_center,
+                robust_value: robust_aggregate(&feasible, probe.aggregate),
+                f_mean,
+                f_median: sorted[n / 2],
+                f_min: sorted[0],
+                f_max: sorted[n - 1],
+                f_std,
+                worst_axis: worst_axis.map(|(a, _)| a),
+                n_feasible: n,
+                n_infeasible,
+            });
+        }
+        result.robustness = Some(stats);
+        n_calls
+    }
+
+    /// [`ShgoOptions::robust_polish`]: re-optimize the chosen minima on the
+    /// stencil-smoothed objective. Returns the number of raw objective
+    /// evaluations made.
+    fn robust_polish(&self, result: &mut ShgoResult, rp: &RobustPolish) -> usize {
+        // Rank by the probe's robust value when available, else by funl order.
+        let order: Vec<usize> = match &result.robustness {
+            Some(stats) => {
+                let mut v: Vec<(usize, f64)> =
+                    stats.iter().map(|s| (s.xl_index, s.robust_value)).collect();
+                v.sort_by(|a, b| {
+                    a.1.partial_cmp(&b.1)
+                        .unwrap_or(std::cmp::Ordering::Equal)
+                        .then(a.0.cmp(&b.0))
+                });
+                v.into_iter().map(|(i, _)| i).collect()
+            }
+            None => (0..result.xl.len()).collect(),
+        };
+        let chosen: Vec<usize> = order.into_iter().take(rp.top).collect();
+
+        let mut local_opts = self.options.local_options.clone();
+        if let Some(me) = rp.maxeval {
+            local_opts.maxeval = Some(me);
+        }
+        if !self.constraints.is_empty() && !local_opts.algorithm.supports_constraints() {
+            local_opts.algorithm = crate::local_opt::LocalOptimizer::Cobyla;
+        }
+
+        let mut out = Vec::with_capacity(chosen.len());
+        let mut total = 0usize;
+        for xi in chosen {
+            let x0 = result.xl[xi].clone();
+            let raw_calls = AtomicUsize::new(0);
+            let smoothed = |x: &[f64]| -> f64 {
+                let (pts, _) = self.stencil_points(x, &rp.stencil, true);
+                let points: Vec<Vec<f64>> = pts.into_iter().map(|(p, _)| p).collect();
+                let (values, calls) = self.evaluate_points(&points);
+                raw_calls.fetch_add(calls, Ordering::Relaxed);
+                let feasible: Vec<f64> = values.into_iter().flatten().collect();
+                robust_aggregate(&feasible, rp.aggregate)
+            };
+            let res = if self.constraints.is_empty() {
+                crate::local_opt::minimize_local(
+                    &smoothed,
+                    &x0,
+                    &self.bounds,
+                    None::<&[fn(&[f64]) -> f64]>,
+                    &local_opts,
+                )
+            } else {
+                let cons: Vec<crate::local_opt::BoxedConstraint> = self
+                    .constraints
+                    .iter()
+                    .map(|c| {
+                        let c = Arc::clone(c);
+                        Box::new(move |x: &[f64]| c(x)) as crate::local_opt::BoxedConstraint
+                    })
+                    .collect();
+                crate::local_opt::minimize_local_constrained(
+                    smoothed,
+                    &x0,
+                    &self.bounds,
+                    &cons,
+                    &local_opts,
+                )
+            };
+            let f_center = (self.func)(&res.x);
+            let nfev = raw_calls.load(Ordering::Relaxed) + 1;
+            total += nfev;
+            out.push(RobustMinimum {
+                xl_index: xi,
+                x: res.x,
+                robust_value: res.fun,
+                f_center,
+                nfev,
+                success: res.success && res.fun.is_finite(),
+            });
+        }
+        out.sort_by(|a, b| {
+            a.robust_value
+                .partial_cmp(&b.robust_value)
+                .unwrap_or(std::cmp::Ordering::Equal)
+                .then(a.xl_index.cmp(&b.xl_index))
+        });
+        result.robust_minima = Some(out);
+        total
+    }
+
     /// Print optimization summary.
     fn print_summary(&self, result: &ShgoResult) {
         println!("\n=== SHGO Optimization Summary ===");
@@ -3548,6 +4024,176 @@ mod tests {
                 .unwrap()
         };
         assert!(run(true).nlfev > run(false).nlfev);
+    }
+
+    /// A deep minimum that is narrow along one axis, and a shallower one that
+    /// is wide in every direction. Raw cost prefers the deep one; a
+    /// perturbation of a few percent of the box prefers the wide one.
+    fn fragile_and_robust(x: &[f64]) -> f64 {
+        let deep = -1.2
+            * (-((x[0] + 1.0).powi(2) / (2.0 * 0.05f64.powi(2))
+                + (x[1] + 1.0).powi(2) / (2.0 * 0.6f64.powi(2))))
+            .exp();
+        let wide = -(-((x[0] - 1.0).powi(2) + (x[1] - 1.0).powi(2)) / (2.0 * 0.36)).exp();
+        deep + wide
+    }
+
+    fn robust_test_options() -> ShgoOptions {
+        ShgoOptions {
+            sampling_method: SamplingMethod::Sobol,
+            connectivity_method: ConnectivityMethod::KNearestNeighbors,
+            n: 2048,
+            knn_neighbors: Some(15),
+            iters: Some(1),
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn test_robustness_probe_ranks_fragile_minimum_as_less_robust() {
+        let result = Shgo::new(fragile_and_robust, vec![(-2.0, 2.0); 2])
+            .with_options(ShgoOptions {
+                robustness_probe: Some(RobustnessProbe::new(0.03, 8)),
+                ..robust_test_options()
+            })
+            .minimize()
+            .unwrap();
+        // Raw ranking: the deep, fragile minimum first.
+        assert!(result.fun < -1.15, "deep minimum not found: {}", result.fun);
+        assert!(result.x[0] < 0.0);
+        let stats = result.robustness.as_ref().expect("probe requested");
+        assert_eq!(stats.len(), result.xl.len());
+        let deep = stats
+            .iter()
+            .find(|s| result.xl[s.xl_index][0] < 0.0)
+            .expect("fragile minimum probed");
+        let wide = stats
+            .iter()
+            .find(|s| result.xl[s.xl_index][0] > 0.0 && result.funl[s.xl_index] < -0.9)
+            .expect("wide minimum probed");
+        // The probe inverts the ranking: the wide basin is more robust.
+        assert!(
+            wide.robust_value < deep.robust_value,
+            "probe did not prefer the wide basin: wide {} deep {}",
+            wide.robust_value,
+            deep.robust_value
+        );
+        assert!(wide.robust_value < -0.9, "wide basin robust value {}", wide.robust_value);
+        assert!(deep.robust_value > -0.9, "fragile basin robust value {}", deep.robust_value);
+        // The fragile axis is identified, and the stencil is fully accounted for.
+        assert_eq!(deep.worst_axis, Some(0));
+        for s in stats {
+            assert_eq!(s.n_feasible + s.n_infeasible, 1 + 2 * 2 + 8);
+            assert!(s.f_min <= s.f_center && s.f_center <= s.f_max);
+            assert!(s.f_std >= 0.0);
+        }
+        // Probe evaluations are counted.
+        let plain = Shgo::new(fragile_and_robust, vec![(-2.0, 2.0); 2])
+            .with_options(robust_test_options())
+            .minimize()
+            .unwrap();
+        assert!(result.nfev > plain.nfev);
+    }
+
+    #[test]
+    fn test_robust_polish_picks_and_refines_the_robust_basin() {
+        let result = Shgo::new(fragile_and_robust, vec![(-2.0, 2.0); 2])
+            .with_options(ShgoOptions {
+                robustness_probe: Some(RobustnessProbe::new(0.03, 8)),
+                robust_polish: Some(RobustPolish::new(0.03, 8, 1)),
+                ..robust_test_options()
+            })
+            .minimize()
+            .unwrap();
+        let rm = result.robust_minima.as_ref().expect("polish requested");
+        assert_eq!(rm.len(), 1);
+        let r = &rm[0];
+        // Chosen by the probe: the wide basin, not the raw global minimum.
+        assert!(result.xl[r.xl_index][0] > 0.0, "polished the fragile basin");
+        assert!(r.success, "robust polish did not converge");
+        assert!((r.x[0] - 1.0).abs() < 0.1 && (r.x[1] - 1.0).abs() < 0.1, "{:?}", r.x);
+        assert!(r.robust_value < -0.9 && r.robust_value >= r.f_center - 1e-9);
+        assert!(r.nfev > 0);
+        // The raw answer is untouched.
+        assert!(result.fun < -1.15 && result.x[0] < 0.0);
+    }
+
+    #[test]
+    fn test_robust_polish_without_probe_ranks_by_cost() {
+        let result = Shgo::new(fragile_and_robust, vec![(-2.0, 2.0); 2])
+            .with_options(ShgoOptions {
+                robust_polish: Some(RobustPolish::new(0.03, 8, 1)),
+                ..robust_test_options()
+            })
+            .minimize()
+            .unwrap();
+        let rm = result.robust_minima.as_ref().unwrap();
+        assert_eq!(rm[0].xl_index, 0, "without a probe the lowest minimum is polished first");
+    }
+
+    #[test]
+    fn test_stencil_accounts_for_bounds_and_constraints() {
+        // Minimum in a corner of the box: the inward axis steps survive, the
+        // outward ones clip onto the centre and are counted as dropped.
+        let result = Shgo::new(sphere, vec![(0.0, 5.0); 2])
+            .with_options(ShgoOptions {
+                robustness_probe: Some(RobustnessProbe {
+                    stencil: Stencil::with_samples(0.05, 4),
+                    aggregate: RobustAggregate::Max,
+                    top: Some(1),
+                }),
+                ..robust_test_options()
+            })
+            .minimize()
+            .unwrap();
+        let s = &result.robustness.as_ref().unwrap()[0];
+        assert!(result.x.iter().all(|v| v.abs() < 1e-6));
+        assert_eq!(s.n_feasible + s.n_infeasible, 1 + 4 + 4);
+        assert!(s.n_infeasible >= 2, "outward axis steps should be dropped");
+        assert_eq!(s.robust_value, s.f_max, "Max aggregate");
+
+        // A constraint that cuts through the minimum: the stencil points on the
+        // wrong side are infeasible and never evaluated.
+        let constraint = |x: &[f64]| x[1] - x[0]; // feasible when x1 >= x0
+        let result = Shgo::with_constraints(sphere, vec![(-5.0, 5.0); 2], vec![constraint])
+            .with_options(ShgoOptions {
+                robustness_probe: Some(RobustnessProbe::new(0.02, 8)),
+                ..robust_test_options()
+            })
+            .minimize()
+            .unwrap();
+        let s = &result.robustness.as_ref().unwrap()[0];
+        assert!(s.n_infeasible >= 1, "no stencil point was infeasible");
+        assert!(s.f_max.is_finite());
+    }
+
+    #[test]
+    fn test_robustness_probe_top_and_determinism() {
+        let run = || {
+            Shgo::new(rastrigin, vec![(-5.12, 5.12); 2])
+                .with_options(ShgoOptions {
+                    n: 256,
+                    robustness_probe: Some(RobustnessProbe {
+                        stencil: Stencil::axes(0.01),
+                        aggregate: RobustAggregate::Cvar { fraction: 0.5 },
+                        top: Some(3),
+                    }),
+                    ..robust_test_options()
+                })
+                .minimize()
+                .unwrap()
+        };
+        let a = run();
+        let b = run();
+        let sa = a.robustness.as_ref().unwrap();
+        let sb = b.robustness.as_ref().unwrap();
+        assert_eq!(sa.len(), 3);
+        for (x, y) in sa.iter().zip(sb.iter()) {
+            assert_eq!(x.xl_index, y.xl_index);
+            assert_eq!(x.f_mean, y.f_mean);
+            assert_eq!(x.robust_value, y.robust_value);
+            assert!(x.robust_value >= x.f_mean - 1e-12, "CVaR is at least the mean");
+        }
     }
 
     #[test]
