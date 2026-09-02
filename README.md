@@ -300,6 +300,24 @@ Function evaluations during **local minimization** are parallelized using
 | 0.1–10 ms | `workers: None` — scales well with core count |
 | > 10 ms | `workers: None` — near-linear speedup |
 
+### Choosing the local optimizer for parallelism
+
+The candidate pool is parallelised across candidates, and each candidate's
+local minimization is a serial chain. A gradient-based method (`Slsqp`,
+`Lbfgs`) additionally fans its `dim` finite differences across threads, so
+which algorithm is fastest depends on how the pool compares with the core
+count. Measured on 16 cores:
+
+| regime | fastest | note |
+|---|---|---|
+| 25 candidates, 15 dims, 1.4 ms objective | BOBYQA (4.8 s vs 8.2 s for `Lbfgs`) | the pool already saturates the threads; the gradient's inner parallelism only adds scheduling |
+| 1 candidate, 12 dims, 0.4 ms objective | `Slsqp` (0.019 s vs 0.037 s) | half the wall clock on 18 % *more* evaluations, because the gradient is 12-wide |
+| evaluations are the scarce resource | `Lbfgs` | 2.5x fewer objective evaluations than BOBYQA in the 15-dimensional case |
+
+BOBYQA remains the default. Consider a gradient method when the candidate pool
+is narrower than the core count, which is the usual state of later iterations
+and of a small `maxiter_local`.
+
 ## SciPy Correspondence
 
 ### Module / Function Mapping
