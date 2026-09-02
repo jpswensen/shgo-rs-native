@@ -18,7 +18,7 @@ examples that write `use shgo_rs::…` fail to compile as doctests.
 
 ```bash
 cargo build --release              # fat LTO + codegen-units=1: slow link, expected
-cargo test                         # 103 unit + 11 cross-validation + 21 doctests, all green
+cargo test                         # 114 unit + 11 cross-validation + 21 doctests, all green
 cargo test --release <test_name>   # run a single test by substring
 cargo test --test cross_validation # Rust vs Python fixture comparison only
 cargo bench                        # criterion benchmarks (benches/benchmarks.rs)
@@ -66,11 +66,15 @@ dispatches on `SamplingMethod`:
   `scipy.stats.qmc.Sobol` unscrambled — verified by fixtures), rounds n up to a power of 2,
   then builds vertex connectivity per `options.connectivity_method`
   (`ConnectivityMethod` enum): `Delaunay` (default, qhull with joggle retry on
-  degeneracy; replicates SciPy's `vf_to_vv` *including its quirk* of only connecting the
-  first two indices of each dim-combination), `KNearestNeighbors` (brute-force
-  O(n²·d), bidirectional), `HNSW` (`hnsw_rs`, approximate), or `ScaNN` (`vecstore`,
-  f32-quantized, falls back to KNN on failure). k defaults to `2·dim + 1`, overridable
-  via `knn_neighbors`. All four connectivity methods build the graph over the **full
+  degeneracy; the **full 1-skeleton** — every edge of every simplex, as in the paper),
+  `DelaunayScipyCompat` (reproduces SciPy's `vf_to_vv` quirk, which for dim ≥ 3 only
+  connects the first three vertices of each simplex and spawns hundreds of spurious
+  candidates — parity testing only), `KNearestNeighbors` (brute-force O(n²·d),
+  bidirectional), `HNSW` (`hnsw_rs`, approximate; queries k+1 and drops the point
+  itself so k means the same as for KNN), or `ScaNN` (`vecstore`, f32-quantized, falls
+  back to KNN on failure). k defaults to `2·dim + 1`, overridable via `knn_neighbors`
+  (see `fable5_review_checklist.md` §4 for how to choose it). All connectivity methods
+  build the graph over the **full
   cumulative point cloud** each iteration (matching SciPy's re-triangulation
   semantics; the KNN build is rayon-parallel; ScaNN query failures fall back to
   brute-force k-NN).
@@ -88,6 +92,9 @@ Shared infrastructure:
   go into pending pools; `process_pools()` batch-evaluates constraints then the
   objective in parallel (rayon). A vertex is a minimizer iff its f is strictly below all
   neighbors'; results are cached per-vertex and invalidated on connect/disconnect.
+  Neighbor sets are `BTreeSet<usize>` on purpose: simplicial refinement queues
+  sub-regions in neighbor order, and a hash-ordered set made the sampled points differ
+  from run to run (`test_budgeted_refinement_is_deterministic` pins this).
 - `Coordinates` (src/coordinates.rs): hashable f64 vector using bit-representation equality
   (so `0.0 != -0.0`, NaN == NaN), pre-computed hash. Used as the dedup key everywhere.
 - `LMapCache` (src/shgo.rs): thread-safe memo of local-minimization results keyed by
@@ -97,7 +104,13 @@ Shared infrastructure:
   the old separate `ShgoOptions.local_optimizer` field was removed in commit 70ec80d;
   when constraints exist and the chosen algorithm can't handle them, SHGO auto-upgrades
   to COBYLA with a warning. SHGO's `g(x) >= 0` convention is negated to NLopt's
-  `fc(x) <= 0`.
+  `fc(x) <= 0`. Both public entry points (`minimize_local`, `minimize_local_constrained`)
+  share one `run_nlopt` core, so constraints are always registered with NLopt.
+  Gradient-based algorithms (`Slsqp`, `Lbfgs`) receive forward finite-difference
+  gradients (SciPy's `'2-point'` scheme, rayon-parallel across coordinates, counted in
+  `nfev`) for the objective and for constraints; NLopt's line-search `Failure` /
+  `RoundoffLimited` after a successful run is reported as converged for those
+  algorithms because it is what finite-difference noise produces at the optimum.
 - `ffi.rs`: C API (`shgo_create`/`shgo_set_options`/`shgo_minimize`/…). The headers in
   `include/shgo.h`/`.hpp` are **manually maintained** — build.rs does not run cbindgen
   (cbindgen.toml exists only for manual regeneration). Any change to `ffi.rs` must be
@@ -112,9 +125,19 @@ evaluations + `nlfev` (all local attempts, matching SciPy's
 Local results enter `xl` whenever their `fun` is finite — converged or budget-capped —
 matching SciPy's `LMC.add_res`, which appends every local result unconditionally; the
 minimizer pool is sorted by f before `maxiter_local` truncation (`sort_min_pool` parity).
+Candidates that sit on an already-found minimum (within `xl_dedup_rtol` of an `xl`
+entry) are skipped, mirroring SciPy's `minimizers()` check against `LMC.xl_maps` —
+without it every minimum re-inserted into the next Sobol iteration was re-minimized.
+`xl`/`funl` are de-duplicated with `xl_dedup_rtol` (relative to bounds width) and
+`xl_dedup_ftol`; SciPy keeps one row per start point (set `xl_dedup_rtol = 0` for
+bitwise-only merging). `iters: None` without any other stopping criterion is rejected
+with `InvalidOption` (it would loop forever). Intentional deviation: Sobol iteration i
+continues the sequence at index `i·n` — SciPy draws `i·n` fresh points and triangulates
+only the tail, so multi-iteration Sobol runs never match SciPy point-for-point.
 
-A full bug/deviation audit with file:line references lives in
-`shgo_fable_recommendations.md` (July 2026).
+Audits: `shgo_fable_recommendations.md` (July 2026, tracked) and, if present,
+`fable5_review_checklist.md` (Sept 2026, untracked; fidelity/bug/parallelism review
+with the k-selection study and the before/after numbers for the fixes above).
 
 ## Downstream consumers
 

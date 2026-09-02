@@ -113,12 +113,23 @@ pub enum SamplingMethod {
 #[derive(Debug, Clone, Copy, PartialEq)]
 #[derive(Default)]
 pub enum ConnectivityMethod {
-    /// Delaunay triangulation via QHull (the default, matching SciPy).
+    /// Delaunay triangulation via QHull (the default): every edge of every
+    /// simplex becomes a graph edge (the full 1-skeleton, as in the SHGO
+    /// paper's Definition 18).
     ///
     /// Produces geometrically correct neighbors but costs O(n^⌈d/2⌉),
     /// making it prohibitively expensive for dimensions > ~7.
     #[default]
     Delaunay,
+
+    /// Delaunay triangulation with SciPy's `vf_to_vv` edge-selection quirk
+    /// reproduced: for `dim >= 3` only the triangle on the first three
+    /// vertices of each simplex is connected, so the graph is much sparser
+    /// than the triangulation and spawns many spurious minimizer candidates
+    /// (e.g. 288 candidates on a 4-D sphere with 4096 points, versus 1 for
+    /// [`ConnectivityMethod::Delaunay`]). Only useful for parity testing
+    /// against SciPy; identical to `Delaunay` for `dim <= 2`.
+    DelaunayScipyCompat,
 
     /// k-nearest-neighbors connectivity.
     ///
@@ -250,6 +261,22 @@ pub struct ShgoOptions {
     /// Only used when connectivity_method is KNearestNeighbors.
     /// Default: None (auto: 2·dim + 1).
     pub knn_neighbors: Option<usize>,
+
+    /// Two local results are treated as the same minimum when every
+    /// coordinate agrees to within `xl_dedup_rtol` times the width of that
+    /// dimension's bounds (and their function values agree to
+    /// [`ShgoOptions::xl_dedup_ftol`]). Used to de-duplicate `xl`/`funl`, to
+    /// map basins onto `xl`, and to avoid re-running a local minimization
+    /// from a sampling point that already sits on a known minimum (SciPy
+    /// skips such vertices too). `0.0` merges only bitwise-identical points.
+    /// Extension — SciPy keeps one `xl` row per starting point. Default: 1e-4.
+    pub xl_dedup_rtol: f64,
+
+    /// Relative function-value tolerance for the `xl` de-duplication:
+    /// `|f_a - f_b| <= xl_dedup_ftol * max(1, |f_a|, |f_b|)`. Guards against
+    /// merging distinct minima that happen to be close in badly scaled
+    /// dimensions. `0.0` disables the function-value check. Default: 1e-6.
+    pub xl_dedup_ftol: f64,
 }
 
 impl Default for ShgoOptions {
@@ -279,6 +306,8 @@ impl Default for ShgoOptions {
             compute_basin_stats: false,
             basin_good_thresholds: Vec::new(),
             basin_tail_fraction: 0.1,
+            xl_dedup_rtol: 1e-4,
+            xl_dedup_ftol: 1e-6,
         }
     }
 }
@@ -559,7 +588,7 @@ where
         }
     }
 
-    let mut out: Vec<BasinStats> = members
+    let mut out: Vec<(usize, BasinStats)> = members
         .into_iter()
         .map(|(r, mut fvals)| {
             fvals.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
@@ -576,26 +605,32 @@ where
             let x_polished = lmap_cache
                 .get(&Coordinates::new(x_sampled.clone()))
                 .map(|lm| lm.x);
-            BasinStats {
-                xl_index: None,
-                x_sampled,
-                x_polished,
-                f_min_sampled: fs[r],
-                size,
-                f_mean,
-                f_median,
-                f_tail,
-                good_counts,
-                persistence: persistence.get(&r).copied().unwrap_or(f64::INFINITY),
-            }
+            (
+                r,
+                BasinStats {
+                    xl_index: None,
+                    x_sampled,
+                    x_polished,
+                    f_min_sampled: fs[r],
+                    size,
+                    f_mean,
+                    f_median,
+                    f_tail,
+                    good_counts,
+                    persistence: persistence.get(&r).copied().unwrap_or(f64::INFINITY),
+                },
+            )
         })
         .collect();
-    out.sort_by(|a, b| {
+    // Ascending by sampled minimum; ties broken by vertex index so the order
+    // does not depend on HashMap iteration.
+    out.sort_by(|(ra, a), (rb, b)| {
         a.f_min_sampled
             .partial_cmp(&b.f_min_sampled)
             .unwrap_or(std::cmp::Ordering::Equal)
+            .then(ra.cmp(rb))
     });
-    out
+    out.into_iter().map(|(_, b)| b).collect()
 }
 
 /// SHGO (Simplicial Homology Global Optimization) optimizer.
@@ -775,19 +810,68 @@ where
         }
     }
 
-    /// Compute effective iters: if any stopping criterion other than iters
-    /// is set, iters becomes None (unlimited). Matches Python behavior.
-    fn effective_iters(&self) -> Option<usize> {
-        if self.options.maxiter.is_some()
+    /// Whether any stopping criterion other than `iters` is set.
+    fn has_other_stopping_criterion(&self) -> bool {
+        self.options.maxiter.is_some()
             || self.options.maxfev.is_some()
             || self.options.maxev.is_some()
             || self.options.maxtime.is_some()
             || self.options.f_min.is_some()
-        {
+    }
+
+    /// Compute effective iters: if any stopping criterion other than iters
+    /// is set, iters becomes None (unlimited). Matches Python behavior.
+    fn effective_iters(&self) -> Option<usize> {
+        if self.has_other_stopping_criterion() {
             None // Other criteria control termination
         } else {
             self.options.iters
         }
+    }
+
+    /// Per-dimension closeness test for two points: each coordinate must
+    /// agree to within `xl_dedup_rtol` times the width of that dimension's
+    /// bounds (for effectively unbounded dimensions the scale is
+    /// `max(1, |x|)` instead). With `xl_dedup_rtol == 0` only bitwise-equal
+    /// points match.
+    fn within_x_tolerance(&self, a: &[f64], b: &[f64]) -> bool {
+        if a.len() != b.len() {
+            return false;
+        }
+        let rtol = self.options.xl_dedup_rtol;
+        if rtol <= 0.0 {
+            return a == b;
+        }
+        a.iter()
+            .zip(b.iter())
+            .zip(self.bounds.iter())
+            .all(|((x, y), (lo, hi))| {
+                let width = hi - lo;
+                let scale = if width.is_finite() && width < 1e30 {
+                    width
+                } else {
+                    x.abs().max(y.abs()).max(1.0)
+                };
+                (x - y).abs() <= rtol * scale
+            })
+    }
+
+    /// Whether two local results describe the same minimum (see
+    /// [`ShgoOptions::xl_dedup_rtol`] / [`ShgoOptions::xl_dedup_ftol`]).
+    fn same_minimum(&self, xa: &[f64], fa: f64, xb: &[f64], fb: f64) -> bool {
+        if !self.within_x_tolerance(xa, xb) {
+            return false;
+        }
+        let ftol = self.options.xl_dedup_ftol;
+        ftol <= 0.0 || (fa - fb).abs() <= ftol * fa.abs().max(fb.abs()).max(1.0)
+    }
+
+    /// Whether `x` sits on an already-known local minimum (SciPy's
+    /// `minimizers()` skips vertices located at `LMC.xl_maps` entries; this
+    /// also covers re-inserted minima, which would otherwise be re-minimized
+    /// every iteration).
+    fn near_known_minimum(&self, x: &[f64], xl: &[Vec<f64>]) -> bool {
+        xl.iter().any(|m| self.within_x_tolerance(x, m))
     }
 
     /// Internal minimize implementation.
@@ -801,6 +885,14 @@ where
 
         // Validate bounds
         self.validate_bounds()?;
+
+        // `iters: None` only makes sense together with another criterion;
+        // otherwise the main loop would never terminate.
+        if self.options.iters.is_none() && !self.has_other_stopping_criterion() {
+            return Err(ShgoError::InvalidOption(
+                "no stopping criterion: set `iters` or one of maxiter / maxfev / maxev / maxtime / f_min".into(),
+            ));
+        }
 
         // Reset evaluation counter (but not cancelled flag - allow pre-cancellation)
         self.fev_count.store(0, Ordering::Relaxed);
@@ -829,12 +921,14 @@ where
             let mut combined: Vec<_> = result.xl.iter().cloned().zip(result.funl.iter().cloned()).collect();
             combined.sort_by(|a, b| a.1.partial_cmp(&b.1).unwrap_or(std::cmp::Ordering::Equal));
 
-            // Deduplicate: remove entries where x is within tolerance of an existing entry
+            // Deduplicate: drop entries that describe an already-kept minimum
+            // (tolerances from `xl_dedup_rtol` / `xl_dedup_ftol`). Entries are
+            // visited in ascending f, so the kept representative is the lowest.
             let mut deduped: Vec<(Vec<f64>, f64)> = Vec::new();
             for (x, f) in &combined {
-                let is_dup = deduped.iter().any(|(ex, _)| {
-                    x.iter().zip(ex.iter()).all(|(a, b)| (a - b).abs() < 1e-10)
-                });
+                let is_dup = deduped
+                    .iter()
+                    .any(|(ex, ef)| self.same_minimum(x, *f, ex, *ef));
                 if !is_dup {
                     deduped.push((x.clone(), *f));
                 }
@@ -872,10 +966,7 @@ where
             if let Some(basins) = basins.as_mut() {
                 for b in basins.iter_mut() {
                     let key = b.x_polished.as_ref().unwrap_or(&b.x_sampled);
-                    b.xl_index = xl.iter().position(|x| {
-                        x.len() == key.len()
-                            && x.iter().zip(key.iter()).all(|(a, c)| (a - c).abs() <= 1e-8)
-                    });
+                    b.xl_index = xl.iter().position(|x| self.within_x_tolerance(x, key));
                 }
             }
         }
@@ -989,7 +1080,9 @@ where
             if self.options.minimize_every_iter {
                 let maxiter_local = self.options.maxiter_local.unwrap_or(usize::MAX);
 
-                // Collect candidates: feasible, not already in LMC
+                // Collect candidates: feasible, not already in LMC, and not
+                // sitting on a minimum that a previous local run already found
+                // (SciPy's `minimizers()` skips vertices at `LMC.xl_maps`).
                 let mut candidates: Vec<_> = minimizers
                     .iter()
                     .filter(|v| v.feasible() != Some(false))
@@ -998,6 +1091,7 @@ where
                             v.coordinates().as_slice().to_vec(),
                         ))
                     })
+                    .filter(|v| !self.near_known_minimum(v.x(), &result.xl))
                     .collect();
                 // SciPy sorts the minimizer pool by function value
                 // (sort_min_pool) before trimming to `local_iter` candidates,
@@ -1257,6 +1351,16 @@ where
                                 &all_vertices,
                                 self.dim,
                                 self.options.disp,
+                                false,
+                            )?;
+                        }
+                        ConnectivityMethod::DelaunayScipyCompat => {
+                            Self::build_delaunay_connectivity(
+                                &all_points,
+                                &all_vertices,
+                                self.dim,
+                                self.options.disp,
+                                true,
                             )?;
                         }
                         ConnectivityMethod::KNearestNeighbors => {
@@ -1299,12 +1403,16 @@ where
             
             // Process minimizers with local optimization
             if self.options.minimize_every_iter {
-                // Filter to feasible vertices, not in LMC, limited count
+                // Filter to feasible vertices, not in LMC, not on a known
+                // minimum (re-inserted minima are graph minimizers by
+                // construction and must not be re-minimized every iteration),
+                // limited count
                 let maxiter_local = self.options.maxiter_local.unwrap_or(usize::MAX);
                 let mut candidates: Vec<_> = minimizers
                     .iter()
                     .filter(|v| v.feasible() != Some(false))
                     .filter(|v| !lmap_cache.contains(&Coordinates::new(v.coordinates().as_slice().to_vec())))
+                    .filter(|v| !self.near_known_minimum(v.x(), &result.xl))
                     .collect();
                 // SciPy sorts the minimizer pool by function value
                 // (sort_min_pool) before trimming to `local_iter` candidates.
@@ -1603,16 +1711,24 @@ where
         // Note: set_searching_mode needs &mut but parallel_search doesn't,
         // so we just search directly — it works for sequential insert+search.
 
-        // Query each point for its k nearest neighbors
+        // Query each point for its k nearest neighbors. The query point is
+        // itself in the index and comes back as its own nearest neighbor, so
+        // ask for k + 1 and drop it — otherwise the effective k is k - 1,
+        // inconsistent with the exact KNN method.
         let ef_search = (k * 2).max(32);
-        let results = hnsw.parallel_search(points, k, ef_search);
+        let results = hnsw.parallel_search(points, k + 1, ef_search);
 
         // Connect bidirectionally based on HNSW results
         for (i, neighbors) in results.iter().enumerate() {
+            let mut taken = 0;
             for nb in neighbors {
                 let j = nb.d_id;
-                if j < vertices.len() {
+                if j != i && j < vertices.len() {
                     crate::Vertex::connect_bidirectional(&vertices[i], &vertices[j]);
+                    taken += 1;
+                    if taken == k {
+                        break;
+                    }
                 }
             }
         }
@@ -1763,11 +1879,18 @@ where
     }
 
     /// Build vertex connectivity using Delaunay triangulation via QHull.
+    ///
+    /// With `scipy_compat == false` every edge of every simplex is added (the
+    /// full 1-skeleton of the triangulation). With `scipy_compat == true`
+    /// SciPy's `vf_to_vv` behaviour is reproduced instead: it iterates
+    /// `combinations(simplex, dim)` and connects `e[0]-e[1]` of each, which for
+    /// `dim >= 3` connects only the first three vertices of each simplex.
     fn build_delaunay_connectivity(
         points: &[Vec<f64>],
         vertices: &[std::sync::Arc<crate::Vertex>],
         dim: usize,
         disp: usize,
+        scipy_compat: bool,
     ) -> Result<(), ShgoError> {
         // Wrap in with_stdout_suppressed to silence upstream debug println
         let qh = with_stdout_suppressed(|| {
@@ -1802,7 +1925,6 @@ where
         })?;
 
         // Convert vertex-face mesh to vertex-vertex connectivity
-        // Matches Python's vf_to_vv: combinations(simplex, dim) → connect e[0]-e[1]
         for simplex in qh.simplices().filter(|f| !f.upper_delaunay()) {
             if let Some(verts) = simplex.vertices() {
                 let simplex_indices: Vec<usize> = verts
@@ -1810,7 +1932,20 @@ where
                     .filter_map(|v| v.index(&qh))
                     .collect();
 
-                if dim >= 2 && simplex_indices.len() >= dim {
+                if !scipy_compat {
+                    // Full 1-skeleton: every pair of simplex vertices is an edge.
+                    for (a, &pi) in simplex_indices.iter().enumerate() {
+                        for &pj in &simplex_indices[a + 1..] {
+                            if pi < vertices.len() && pj < vertices.len() {
+                                crate::Vertex::connect_bidirectional(
+                                    &vertices[pi],
+                                    &vertices[pj],
+                                );
+                            }
+                        }
+                    }
+                } else if dim >= 2 && simplex_indices.len() >= dim {
+                    // SciPy parity: combinations(simplex, dim) → connect e[0]-e[1]
                     let mut combo: Vec<usize> = (0..dim).collect();
                     let n = simplex_indices.len();
                     loop {
@@ -1951,7 +2086,7 @@ where
                 .iter()
                 .map(|c| {
                     let c = Arc::clone(c);
-                    Box::new(move |x: &[f64]| c(x)) as Box<dyn Fn(&[f64]) -> f64>
+                    Box::new(move |x: &[f64]| c(x)) as crate::local_opt::BoxedConstraint
                 })
                 .collect();
 
@@ -1972,10 +2107,13 @@ where
             )
         };
 
+        // A NaN objective value would poison the f-ordered caches; treat it as
+        // infeasible (+inf), like the sampling path does.
+        let fun = if result.fun.is_nan() { f64::INFINITY } else { result.fun };
         let local_min = LocalMinimum {
             x: result.x,
-            fun: result.fun,
-            success: result.success,
+            fun,
+            success: result.success && fun.is_finite(),
             nfev: result.nfev,
             nit: result.nit,
         };
@@ -2646,6 +2784,153 @@ mod tests {
         // 64 points sampled in iteration 1 >= maxev = 60 → stop immediately.
         // (The old bug compared feasible evals (~32) and ran a 2nd iteration.)
         assert_eq!(result.nit, 1);
+    }
+
+    /// Regression: a minimum re-inserted into the next iteration's point cloud
+    /// is a graph minimizer by construction and used to be re-minimized every
+    /// iteration. In 1-D the sorted-adjacency graph of a convex function has
+    /// exactly one minimizer, so after iteration 1 the only candidate is the
+    /// re-inserted minimum itself and no further local runs may happen.
+    #[test]
+    fn test_known_minimum_not_reminimized() {
+        let bowl = |x: &[f64]| (x[0] - 0.3).powi(2);
+        let run = |maxiter| {
+            Shgo::new(bowl, vec![(-1.0, 1.0)])
+                .with_options(ShgoOptions {
+                    sampling_method: SamplingMethod::Sobol,
+                    n: 8,
+                    maxiter: Some(maxiter),
+                    ..Default::default()
+                })
+                .minimize()
+                .unwrap()
+        };
+        let one = run(1);
+        let three = run(3);
+        assert_eq!(three.nit, 3);
+        assert!(one.nlfev > 0);
+        assert_eq!(
+            three.nlfev, one.nlfev,
+            "iterations 2-3 re-minimized the re-inserted minimum ({} -> {} local evals)",
+            one.nlfev, three.nlfev
+        );
+        assert_eq!(three.xl.len(), 1);
+        assert!((three.x[0] - 0.3).abs() < 1e-6);
+    }
+
+    /// The full Delaunay 1-skeleton (paper Definition 18) yields exactly one
+    /// minimizer candidate on a bowl; SciPy's `vf_to_vv` quirk, kept as
+    /// `DelaunayScipyCompat`, connects only the first three vertices of each
+    /// simplex for dim >= 3 and produces spurious candidates.
+    #[test]
+    fn test_delaunay_full_skeleton_has_no_spurious_minimizers() {
+        for (dim, n) in [(3usize, 256usize), (4, 512)] {
+            let candidates = |method| {
+                Shgo::new(sphere, vec![(-5.0, 5.0); dim])
+                    .with_options(ShgoOptions {
+                        sampling_method: SamplingMethod::Sobol,
+                        connectivity_method: method,
+                        n,
+                        iters: Some(1),
+                        minimize_every_iter: false,
+                        ..Default::default()
+                    })
+                    .minimize()
+                    .unwrap()
+                    .xl
+                    .len()
+            };
+            let full = candidates(ConnectivityMethod::Delaunay);
+            let compat = candidates(ConnectivityMethod::DelaunayScipyCompat);
+            assert_eq!(full, 1, "dim {} n {}: full skeleton gave {} candidates", dim, n, full);
+            assert!(compat > full, "dim {} n {}: compat gave {} candidates", dim, n, compat);
+        }
+    }
+
+    #[test]
+    fn test_no_stopping_criterion_is_an_error() {
+        let result = Shgo::new(sphere, vec![(-5.0, 5.0); 2])
+            .with_options(ShgoOptions {
+                iters: None,
+                ..Default::default()
+            })
+            .minimize();
+        assert!(matches!(result, Err(ShgoError::InvalidOption(_))));
+    }
+
+    /// Local runs that end in a NaN region must not enter `xl` or poison the
+    /// f-ordered caches.
+    #[test]
+    fn test_nan_region_local_results_are_excluded() {
+        let f = |x: &[f64]| if x[0] < 0.0 { f64::NAN } else { sphere(x) };
+        let result = Shgo::new(f, vec![(-5.0, 5.0); 2])
+            .with_options(ShgoOptions {
+                sampling_method: SamplingMethod::Sobol,
+                connectivity_method: ConnectivityMethod::KNearestNeighbors,
+                n: 64,
+                iters: Some(1),
+                ..Default::default()
+            })
+            .minimize()
+            .unwrap();
+        assert!(result.success);
+        assert!(result.fun.is_finite());
+        assert!(result.funl.iter().all(|f| f.is_finite()));
+    }
+
+    /// `xl` de-duplication uses a tolerance tied to the bounds, so two local
+    /// runs converging to the same minimum from different starts collapse to
+    /// one row (2-D Rastrigin has 121 minima in this box).
+    #[test]
+    fn test_xl_dedup_merges_near_duplicates() {
+        let bounds = vec![(-5.12, 5.12); 2];
+        let result = Shgo::new(rastrigin, bounds.clone())
+            .with_options(ShgoOptions {
+                sampling_method: SamplingMethod::Sobol,
+                connectivity_method: ConnectivityMethod::KNearestNeighbors,
+                n: 256,
+                maxiter: Some(2),
+                ..Default::default()
+            })
+            .minimize()
+            .unwrap();
+        assert!(result.xl.len() <= 121, "{} rows for 121 minima", result.xl.len());
+        let tol = 1e-4 * 10.24;
+        for i in 0..result.xl.len() {
+            for j in 0..i {
+                let close = result.xl[i]
+                    .iter()
+                    .zip(&result.xl[j])
+                    .all(|(a, b)| (a - b).abs() <= tol);
+                assert!(!close, "rows {} and {} are the same minimum", i, j);
+            }
+        }
+    }
+
+    /// Gradient-based local optimizers must move (they used to receive no
+    /// gradient and returned every start point unchanged after one evaluation).
+    #[test]
+    fn test_gradient_based_local_optimizers_through_shgo() {
+        use crate::local_opt::LocalOptimizer;
+        let shifted = |x: &[f64]| x.iter().map(|v| (v - 0.3).powi(2)).sum::<f64>();
+        for alg in [LocalOptimizer::Slsqp, LocalOptimizer::Lbfgs] {
+            let result = Shgo::new(shifted, vec![(-5.0, 5.0); 4])
+                .with_options(ShgoOptions {
+                    sampling_method: SamplingMethod::Sobol,
+                    connectivity_method: ConnectivityMethod::KNearestNeighbors,
+                    n: 256,
+                    iters: Some(1),
+                    local_options: crate::local_opt::LocalOptimizerOptions {
+                        algorithm: alg,
+                        ..crate::local_opt::LocalOptimizerOptions::default()
+                    },
+                    ..Default::default()
+                })
+                .minimize()
+                .unwrap();
+            assert!(result.fun < 1e-8, "{:?}: fun = {}", alg, result.fun);
+            assert!(result.nlfev > 4 * result.xl.len(), "{:?}: only {} local evals", alg, result.nlfev);
+        }
     }
 
     #[test]

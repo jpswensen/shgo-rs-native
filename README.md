@@ -20,12 +20,17 @@ among them. Key properties:
 - **Two sampling modes** — *Simplicial* (default, topology-aware) and *Sobol*
   (quasi-random, higher dimensional).
 
-This crate is a faithful port of the SciPy SHGO implementation, with all
-deviations and extensions documented (see `shgo_fable_recommendations.md`).
-Python cross-validation fixtures cover Sobol sequences, Delaunay
-triangulation, vertex caching, the simplicial complex, minimizer pool
-construction, and final result values — all verified to match SciPy output
-bit-for-bit where floating-point arithmetic allows.
+This crate is a port of the SciPy SHGO implementation with its deviations and
+extensions documented (see `shgo_fable_recommendations.md`). Python
+cross-validation fixtures pin what actually matches SciPy: Sobol sequence
+values (bit-exact), the initial simplicial triangulation (vertices and edges),
+vertex caching and minimizer detection, and end-to-end optimum values for
+single-iteration runs. Not identical to SciPy by design: the local optimizer
+(BOBYQA instead of SLSQP), Sobol-sequence continuation across iterations
+(SciPy's own is buggy), the Delaunay edge set (SciPy's `vf_to_vv` drops most
+simplex edges for `dim >= 3`; the faithful reproduction is available as
+`ConnectivityMethod::DelaunayScipyCompat`), the de-duplication of `xl`, and the
+simplicial refinement order beyond the first iteration.
 
 ## Usage
 
@@ -156,9 +161,15 @@ for (i, (x, f)) in result.xl.iter().zip(result.funl.iter()).enumerate() {
 | `minimize_every_iter` | `bool` | `true` | Run local minimization each iter |
 | `maxiter_local` | `Option<usize>` | `None` | Max local minimizations per iter |
 | `disp` | `usize` | `0` | Verbosity (0=silent, 1=summary, 2=detailed) |
-| `local_options` | `LocalOptimizerOptions` | BOBYQA, tol 1e-12 | Local solver algorithm + tolerances (`local_options.algorithm`) |
+| `local_options` | `LocalOptimizerOptions` | BOBYQA, tol 1e-12 | Local solver algorithm + tolerances (`local_options.algorithm`). Note `LocalOptimizerOptions::default()` on its own uses `ftol_rel = 1e-8`. |
 | `workers` | `Option<usize>` | `None` | Thread count (`None` = all cores) |
+| `xl_dedup_rtol` | `f64` | `1e-4` | Two local results are the same minimum when every coordinate agrees to this fraction of the bounds width (also stops re-minimizing sampling points that sit on a known minimum); `0` = bitwise only |
+| `xl_dedup_ftol` | `f64` | `1e-6` | Relative function-value agreement additionally required for merging |
 | `f_min` + `f_tol` | — | — | Precision-based early stopping |
+
+`iters: None` is only accepted together with another stopping criterion
+(`maxiter`, `maxfev`, `maxev`, `maxtime` or `f_min`); otherwise `minimize()`
+returns `ShgoError::InvalidOption` instead of looping forever.
 
 ### Sampling Methods
 
@@ -174,9 +185,10 @@ The sampling graph used for topological minimizer detection is configurable via
 
 | Variant | Description |
 |---|---|
-| `ConnectivityMethod::Delaunay` | QHull Delaunay triangulation (default, matches SciPy). Cost grows combinatorially with dimension — impractical above ~7 dims. |
+| `ConnectivityMethod::Delaunay` | QHull Delaunay triangulation, full 1-skeleton (default; every simplex edge, as in the SHGO paper). Cost grows combinatorially with dimension — impractical above ~7 dims. |
+| `ConnectivityMethod::DelaunayScipyCompat` | Delaunay with SciPy's `vf_to_vv` quirk reproduced (for `dim >= 3` only the first three vertices of each simplex are connected, which yields hundreds of spurious minimizer candidates). Parity testing only. |
 | `ConnectivityMethod::KNearestNeighbors` | Exact brute-force k-NN (rayon-parallel, O(n²·d)). Recommended for dim ≳ 7. |
-| `ConnectivityMethod::HNSW` | Approximate k-NN via `hnsw_rs`. Only pays off for very large point sets. |
+| `ConnectivityMethod::HNSW` | Approximate k-NN via `hnsw_rs` (the query point itself is excluded, so `k` means the same as for exact k-NN). Only pays off for very large point sets. |
 | `ConnectivityMethod::ScaNN` | Quantized approximate k-NN via `vecstore` (experimental; falls back to exact k-NN on failure). |
 
 All methods build the graph over the full cumulative point cloud each iteration,
@@ -188,8 +200,8 @@ matching SciPy's re-triangulation semantics.
 |---|---|---|
 | `LocalOptimizer::Bobyqa` | `LN_BOBYQA` | Default. Derivative-free, supports bounds. |
 | `LocalOptimizer::Cobyla` | `LN_COBYLA` | Supports nonlinear inequality constraints. |
-| `LocalOptimizer::Slsqp` | `LD_SLSQP` | Gradient-based, sequential least squares. |
-| `LocalOptimizer::Lbfgs` | `LD_LBFGS` | Limited-memory BFGS, gradient-based. |
+| `LocalOptimizer::Slsqp` | `LD_SLSQP` | Gradient-based, sequential least squares; supports inequality constraints. Gradients by forward finite differences, evaluated in parallel (rayon) and counted in `nfev`. |
+| `LocalOptimizer::Lbfgs` | `LD_LBFGS` | Limited-memory BFGS, gradient-based (finite-difference gradients as above). |
 | `LocalOptimizer::NelderMead` | `LN_NELDERMEAD` | Simplex method, no bounds. |
 | `LocalOptimizer::Praxis` | `LN_PRAXIS` | Principal axis method. |
 | `LocalOptimizer::NewuoaBound` | `LN_NEWUOA_BOUND` | NEWUOA with bound constraints. |
@@ -315,16 +327,20 @@ cross-validation suite:
 
 - **Sobol sequences** — direction numbers and sequence values match SciPy
   `scipy.stats.qmc.Sobol` exactly.
-- **Triangulation** — Delaunay simplices, sorted and compared against
-  `scipy.spatial.Delaunay`.
-- **Vertex operations** — sorting, normalization, and connectivity match the
-  Python `Vertex` / `VertexCache` classes.
-- **Simplicial complex** — complex construction, refinement, and minimizer
-  pool topology match SciPy.
+- **Vertex operations** — midpoints, field evaluation, and minimizer detection
+  match the Python `Vertex` / `VertexCache` classes.
+- **Simplicial complex** — the initial triangulation (vertex count and 2-D
+  connectivity) matches SciPy; per-iteration growth matches SciPy's `+n`
+  semantics. Refinement order beyond the first iteration is deterministic but
+  not identical to SciPy's.
 - **Minimizer results** — end-to-end fixtures (`tests/generate_e2e_fixtures.py`)
   record `scipy.optimize.shgo` results for sphere/Rosenbrock/constrained cases
   across both sampling modes; `test_end_to_end_matches_scipy` replays them in
-  Rust and asserts agreement.
+  Rust and asserts agreement of the optimum.
+- **Regression tests** for the behaviours fixed in September 2026: deterministic
+  refinement, no re-minimization of known minima, full-skeleton Delaunay
+  connectivity, working finite-difference gradients for SLSQP/L-BFGS, and
+  constraints honoured by the public local-minimization API.
 
 Run the full test suite:
 

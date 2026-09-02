@@ -14,9 +14,12 @@
 //!
 //! - **SLSQP**: Sequential Least Squares Programming.
 //!   Gradient-based, supports both equality and inequality constraints.
+//!   Gradients are supplied by forward finite differences (SciPy's default
+//!   `'2-point'` scheme), evaluated in parallel across coordinates with rayon.
 //!
 //! - **LBFGS**: Limited-memory Broyden-Fletcher-Goldfarb-Shanno.
-//!   Gradient-based, good for smooth unconstrained problems.
+//!   Gradient-based (finite-difference gradients as above), good for smooth
+//!   unconstrained problems.
 //!
 //! - **NelderMead**: Nelder-Mead simplex method.
 //!   Derivative-free, robust for noisy functions.
@@ -46,8 +49,8 @@
 //! ```
 
 use nlopt::{Algorithm, Nlopt, Target};
-use std::cell::Cell;
-use std::rc::Rc;
+use rayon::prelude::*;
+use std::sync::atomic::{AtomicUsize, Ordering};
 
 /// Local optimization algorithm selection.
 ///
@@ -71,11 +74,12 @@ pub enum LocalOptimizer {
     Cobyla,
 
     /// Sequential Least Squares Programming.
-    /// Gradient-based, supports equality and inequality constraints.
+    /// Gradient-based (finite-difference gradients), supports inequality
+    /// constraints.
     Slsqp,
 
     /// Limited-memory BFGS.
-    /// Gradient-based, bounds only.
+    /// Gradient-based (finite-difference gradients), bounds only.
     Lbfgs,
 
     /// Nelder-Mead simplex method.
@@ -115,7 +119,7 @@ impl LocalOptimizer {
         matches!(self, LocalOptimizer::Cobyla | LocalOptimizer::Slsqp)
     }
 
-    /// Check if the algorithm requires gradients.
+    /// Check if the algorithm requires gradients (supplied by finite differences).
     pub fn requires_gradient(self) -> bool {
         matches!(self, LocalOptimizer::Slsqp | LocalOptimizer::Lbfgs)
     }
@@ -143,7 +147,8 @@ pub struct LocalOptimizerOptions {
     /// Stop when all |x_new - x_old| < xtol_abs.
     pub xtol_abs: f64,
 
-    /// Maximum number of function evaluations.
+    /// Maximum number of function evaluations (finite-difference gradient
+    /// evaluations count towards this budget, as in SciPy).
     pub maxeval: Option<u32>,
 
     /// Maximum time in seconds.
@@ -178,7 +183,11 @@ impl Default for LocalOptimizerOptions {
 }
 
 /// Boxed inequality-constraint function (`g(x) >= 0` means feasible).
-pub type BoxedConstraint = Box<dyn Fn(&[f64]) -> f64>;
+pub type BoxedConstraint = Box<dyn Fn(&[f64]) -> f64 + Send + Sync>;
+
+/// A scalar function reference usable from the NLOPT callbacks (and from the
+/// rayon workers that evaluate finite-difference gradients).
+type ScalarFn<'a> = &'a (dyn Fn(&[f64]) -> f64 + Sync);
 
 /// Result of a local minimization.
 #[derive(Debug, Clone)]
@@ -191,7 +200,8 @@ pub struct LocalOptResult {
     pub success: bool,
     /// Status message.
     pub message: String,
-    /// Number of function evaluations used.
+    /// Number of function evaluations used (including finite-difference
+    /// gradient evaluations).
     pub nfev: usize,
     /// Number of iterations (not always available).
     pub nit: usize,
@@ -211,37 +221,48 @@ impl LocalOptResult {
     }
 }
 
-/// Perform local minimization using NLOPT.
+/// Forward finite-difference gradient of `f` at `x` (SciPy's `'2-point'`
+/// scheme: relative step `sqrt(eps) * max(1, |x_i|)`, stepping backwards when a
+/// forward step would leave the bounds). The `dim` perturbed evaluations run in
+/// parallel on the rayon pool. Returns the number of function evaluations made.
+fn fd_gradient(
+    f: ScalarFn<'_>,
+    x: &[f64],
+    fx: f64,
+    bounds: &[(f64, f64)],
+    grad: &mut [f64],
+) -> usize {
+    let rel_step = f64::EPSILON.sqrt();
+    grad.par_iter_mut().enumerate().for_each(|(i, g)| {
+        let mut h = rel_step * x[i].abs().max(1.0);
+        let (lb, ub) = bounds.get(i).copied().unwrap_or((f64::NEG_INFINITY, f64::INFINITY));
+        // Prefer a forward step; fall back to a backward step at the upper bound.
+        if x[i] + h > ub && x[i] - h >= lb {
+            h = -h;
+        }
+        let mut xp = x.to_vec();
+        xp[i] += h;
+        // Recompute the actual step (guards against rounding for tiny |h|).
+        let actual = xp[i] - x[i];
+        let fp = f(&xp);
+        *g = if actual != 0.0 { (fp - fx) / actual } else { 0.0 };
+    });
+    x.len()
+}
+
+/// Run one NLOPT local minimization. Shared by the two public entry points.
 ///
-/// # Arguments
-///
-/// * `func` - The objective function to minimize.
-/// * `x0` - Initial guess for the optimization parameters.
-/// * `bounds` - Bounds for each dimension as (lower, upper) pairs.
-/// * `constraints` - Optional inequality constraints where g(x) >= 0 means
-///   feasible. SHGO uses g(x) >= 0 convention, we convert to NLOPT's g(x) <= 0.
-/// * `options` - Local optimizer configuration.
-///
-/// # Returns
-///
-/// Returns a `LocalOptResult` with the optimization results.
-///
-/// # Note
-///
-/// Since NLOPT's `Nlopt` struct is `!Send` and `!Sync`, this function creates
-/// a fresh optimizer instance for each call. For parallel optimization, each
-/// thread should call this function independently.
-pub fn minimize_local<F, G>(
-    func: &F,
+/// `constraints` are inequality constraints in SHGO's `g(x) >= 0` convention;
+/// if any are present and `options.algorithm` cannot handle them the run is
+/// upgraded to COBYLA. Gradient-based algorithms receive forward-difference
+/// gradients of the objective and of every constraint.
+fn run_nlopt(
+    func: ScalarFn<'_>,
     x0: &[f64],
     bounds: &[(f64, f64)],
-    constraints: Option<&[G]>,
+    constraints: &[ScalarFn<'_>],
     options: &LocalOptimizerOptions,
-) -> LocalOptResult
-where
-    F: Fn(&[f64]) -> f64,
-    G: Fn(&[f64]) -> f64,
-{
+) -> LocalOptResult {
     let dim = x0.len();
 
     // Validate dimensions
@@ -256,183 +277,37 @@ where
         );
     }
 
-    // Check if constraints are supported
-    if constraints.is_some() && !options.algorithm.supports_constraints() {
-        // Fall back to COBYLA for constrained problems
-        let mut fallback_opts = options.clone();
-        fallback_opts.algorithm = LocalOptimizer::Cobyla;
-        return minimize_local(func, x0, bounds, constraints, &fallback_opts);
-    }
+    // Constrained problems need a constraint-capable algorithm.
+    let algo = if !constraints.is_empty() && !options.algorithm.supports_constraints() {
+        LocalOptimizer::Cobyla
+    } else {
+        options.algorithm
+    };
+    let needs_grad = algo.requires_gradient();
 
-    // Track function evaluations using interior mutability
-    let fev_count = Rc::new(Cell::new(0usize));
-    let fev_counter = Rc::clone(&fev_count);
+    // Track function evaluations (finite-difference evaluations included).
+    let fev_count = AtomicUsize::new(0);
     let disp = options.disp;
-    let algo = options.algorithm;
 
-    // Create the objective function wrapper for NLOPT
+    // Objective wrapper for NLOPT.
     // Signature: (&[f64], Option<&mut [f64]>, &mut UserData) -> f64
-    let objective = move |x: &[f64], _grad: Option<&mut [f64]>, _: &mut ()| -> f64 {
-        let n = fev_counter.get() + 1;
-        fev_counter.set(n);
+    let objective = |x: &[f64], grad: Option<&mut [f64]>, _: &mut ()| -> f64 {
+        let n = fev_count.fetch_add(1, Ordering::Relaxed) + 1;
         let val = func(x);
         if disp {
             println!("  [{:?} eval #{:>3}] f = {:+.6e}", algo, n, val);
         }
-        val
-    };
-
-    // Create NLOPT optimizer
-    let algorithm = options.algorithm.to_nlopt_algorithm();
-    let mut opt = Nlopt::new(algorithm, dim, objective, Target::Minimize, ());
-
-    // Set bounds
-    let lower_bounds: Vec<f64> = bounds.iter().map(|(l, _)| *l).collect();
-    let upper_bounds: Vec<f64> = bounds.iter().map(|(_, u)| *u).collect();
-
-    if opt.set_lower_bounds(&lower_bounds).is_err() {
-        return LocalOptResult::failure(x0, "Failed to set lower bounds".to_string());
-    }
-    if opt.set_upper_bounds(&upper_bounds).is_err() {
-        return LocalOptResult::failure(x0, "Failed to set upper bounds".to_string());
-    }
-
-    // Set tolerances
-    let _ = opt.set_ftol_rel(options.ftol_rel);
-    let _ = opt.set_ftol_abs(options.ftol_abs);
-    let _ = opt.set_xtol_rel(options.xtol_rel);
-    let _ = opt.set_xtol_abs1(options.xtol_abs);
-
-    // Set evaluation limits
-    if let Some(maxeval) = options.maxeval {
-        let _ = opt.set_maxeval(maxeval);
-    }
-    if let Some(maxtime) = options.maxtime {
-        let _ = opt.set_maxtime(maxtime);
-    }
-
-    // Set initial step if specified
-    if let Some(step) = options.initial_step {
-        let _ = opt.set_initial_step1(step);
-    }
-
-    // Note: Adding constraints requires a more complex setup because NLOPT's
-    // add_inequality_constraint takes ownership of the constraint function.
-    // For now, we handle constraints by filtering results after optimization.
-    // A full implementation would use add_inequality_constraint for COBYLA/SLSQP.
-
-    // Run optimization
-    let mut x = x0.to_vec();
-    let result = opt.optimize(&mut x);
-
-    let final_fev = fev_count.get();
-
-    if disp {
-        match &result {
-            Ok((state, fval)) => println!(
-                "  [{:?}] {:?}: f_best = {:+.6e} ({} evals)",
-                algo, state, fval, final_fev
-            ),
-            Err((state, fval)) => println!(
-                "  [{:?}] FAILED {:?}: f_best = {:+.6e} ({} evals)",
-                algo, state, fval, final_fev
-            ),
-        }
-    }
-
-    match result {
-        Ok((success_state, fval)) => LocalOptResult {
-            x,
-            fun: fval,
-            success: true,
-            message: format!("Optimization succeeded: {:?}", success_state),
-            nfev: final_fev,
-            nit: 0, // NLOPT doesn't track iterations for all algorithms
-        },
-        Err((fail_state, fval)) => {
-            // All FailState variants are actual errors
-            LocalOptResult {
-                x,
-                fun: fval,
-                success: false,
-                message: format!("Optimization failed: {:?}", fail_state),
-                nfev: final_fev,
-                nit: 0,
+        if let Some(g) = grad {
+            if needs_grad {
+                let used = fd_gradient(func, x, val, bounds, g);
+                fev_count.fetch_add(used, Ordering::Relaxed);
             }
         }
-    }
-}
-
-/// Perform local minimization with constraints using NLOPT's constraint support.
-///
-/// This version properly adds inequality constraints to the optimizer for
-/// algorithms that support them (COBYLA, SLSQP).
-///
-/// # Arguments
-///
-/// * `func` - The objective function to minimize.
-/// * `x0` - Initial guess for the optimization parameters.
-/// * `bounds` - Bounds for each dimension as (lower, upper) pairs.
-/// * `constraints` - Inequality constraints where g(x) >= 0 means feasible.
-/// * `options` - Local optimizer configuration.
-///
-/// # Returns
-///
-/// Returns a `LocalOptResult` with the optimization results.
-pub fn minimize_local_constrained<F>(
-    func: F,
-    x0: &[f64],
-    bounds: &[(f64, f64)],
-    constraints: &[BoxedConstraint],
-    options: &LocalOptimizerOptions,
-) -> LocalOptResult
-where
-    F: Fn(&[f64]) -> f64,
-{
-    let dim = x0.len();
-
-    // Validate dimensions
-    if bounds.len() != dim {
-        return LocalOptResult::failure(
-            x0,
-            format!(
-                "Dimension mismatch: x0 has {} elements but bounds has {}",
-                dim,
-                bounds.len()
-            ),
-        );
-    }
-
-    // For constrained optimization, use COBYLA or SLSQP
-    let algorithm = if options.algorithm.supports_constraints() {
-        options.algorithm.to_nlopt_algorithm()
-    } else {
-        Algorithm::Cobyla
-    };
-
-    // Track function evaluations using interior mutability
-    let fev_count = Rc::new(Cell::new(0usize));
-    let fev_counter = Rc::clone(&fev_count);
-    let disp = options.disp;
-    let algo_enum = if options.algorithm.supports_constraints() {
-        options.algorithm
-    } else {
-        LocalOptimizer::Cobyla
-    };
-
-    // Create the objective function wrapper
-    let objective = move |x: &[f64], _grad: Option<&mut [f64]>, _: &mut ()| -> f64 {
-        let n = fev_counter.get() + 1;
-        fev_counter.set(n);
-        let val = func(x);
-        if disp {
-            println!("  [{:?} eval #{:>3}] f = {:+.6e}", algo_enum, n, val);
-        }
         val
     };
 
     // Create NLOPT optimizer
-    let mut opt = Nlopt::new(algorithm, dim, objective, Target::Minimize, ());
+    let mut opt = Nlopt::new(algo.to_nlopt_algorithm(), dim, objective, Target::Minimize, ());
 
     // Set bounds
     let lower_bounds: Vec<f64> = bounds.iter().map(|(l, _)| *l).collect();
@@ -445,15 +320,22 @@ where
         return LocalOptResult::failure(x0, "Failed to set upper bounds".to_string());
     }
 
-    // Add constraints
-    // SHGO uses g(x) >= 0 (feasible), NLOPT uses fc(x) <= 0 (feasible)
-    // So we add constraint: -g(x) <= 0 ⟺ g(x) >= 0
-    for constraint in constraints {
-        // Create a wrapper that negates the constraint
-        let constraint_wrapper = |x: &[f64], _grad: Option<&mut [f64]>, _: &mut ()| -> f64 {
-            -constraint(x) // Negate: g(x) >= 0 becomes -g(x) <= 0
+    // Add constraints.
+    // SHGO uses g(x) >= 0 (feasible), NLOPT uses fc(x) <= 0 (feasible), so
+    // register -g(x) <= 0. Gradient-based algorithms also get d(-g)/dx by
+    // finite differences (constraint evaluations are not counted in nfev,
+    // matching SciPy which reports objective evaluations only).
+    for &g_fn in constraints {
+        let negated = move |x: &[f64]| -g_fn(x);
+        let constraint_wrapper = move |x: &[f64], grad: Option<&mut [f64]>, _: &mut ()| -> f64 {
+            let v = negated(x);
+            if let Some(gr) = grad {
+                if needs_grad {
+                    fd_gradient(&negated, x, v, bounds, gr);
+                }
+            }
+            v
         };
-
         if opt
             .add_inequality_constraint(constraint_wrapper, (), options.constraint_tol)
             .is_err()
@@ -485,42 +367,155 @@ where
     let mut x = x0.to_vec();
     let result = opt.optimize(&mut x);
 
-    let final_fev = fev_count.get();
+    let final_fev = fev_count.load(Ordering::Relaxed);
 
     if disp {
         match &result {
             Ok((state, fval)) => println!(
                 "  [{:?}] {:?}: f_best = {:+.6e} ({} evals)",
-                algo_enum, state, fval, final_fev
+                algo, state, fval, final_fev
             ),
             Err((state, fval)) => println!(
                 "  [{:?}] FAILED {:?}: f_best = {:+.6e} ({} evals)",
-                algo_enum, state, fval, final_fev
+                algo, state, fval, final_fev
             ),
         }
     }
 
     match result {
+        // NLOPT reports a success state even when the objective is non-finite
+        // everywhere it looked (it then just stops on xtol); do not call that
+        // a success. `fun` is returned as-is so callers can see what happened.
+        Ok((success_state, fval)) if !fval.is_finite() => LocalOptResult {
+            x,
+            fun: fval,
+            success: false,
+            message: format!(
+                "Optimization failed: objective is non-finite at the returned point ({:?})",
+                success_state
+            ),
+            nfev: final_fev,
+            nit: 0,
+        },
         Ok((success_state, fval)) => LocalOptResult {
             x,
             fun: fval,
             success: true,
             message: format!("Optimization succeeded: {:?}", success_state),
             nfev: final_fev,
-            nit: 0,
+            nit: 0, // NLOPT doesn't track iterations for all algorithms
         },
         Err((fail_state, fval)) => {
-            // All FailState variants are actual errors
-            LocalOptResult {
-                x,
-                fun: fval,
-                success: false,
-                message: format!("Optimization failed: {:?}", fail_state),
-                nfev: final_fev,
-                nit: 0,
+            // With finite-difference gradients, NLOPT's line search stops
+            // being able to make progress once the objective change per step
+            // drops below the gradient noise — which happens precisely at
+            // convergence (e.g. L-BFGS on a quadratic reaches f ~ 1e-20 and
+            // then reports a generic `Failure`). `x`/`fval` hold the best
+            // point found, so report that as converged rather than as an
+            // error. Genuine problems (invalid arguments, bad bounds) still
+            // fail before any evaluation and are reported as failures.
+            let stalled_at_precision = needs_grad
+                && matches!(
+                    fail_state,
+                    nlopt::FailState::Failure | nlopt::FailState::RoundoffLimited
+                )
+                && fval.is_finite()
+                && final_fev > 1;
+            if stalled_at_precision {
+                LocalOptResult {
+                    x,
+                    fun: fval,
+                    success: true,
+                    message: format!(
+                        "Optimization succeeded: line search stalled at finite-difference precision ({:?})",
+                        fail_state
+                    ),
+                    nfev: final_fev,
+                    nit: 0,
+                }
+            } else {
+                LocalOptResult {
+                    x,
+                    fun: fval,
+                    success: false,
+                    message: format!("Optimization failed: {:?}", fail_state),
+                    nfev: final_fev,
+                    nit: 0,
+                }
             }
         }
     }
+}
+
+/// Perform local minimization using NLOPT.
+///
+/// # Arguments
+///
+/// * `func` - The objective function to minimize.
+/// * `x0` - Initial guess for the optimization parameters.
+/// * `bounds` - Bounds for each dimension as (lower, upper) pairs.
+/// * `constraints` - Optional inequality constraints where g(x) >= 0 means
+///   feasible. SHGO uses g(x) >= 0 convention, we convert to NLOPT's g(x) <= 0.
+///   If the chosen algorithm cannot handle constraints the run is upgraded to
+///   COBYLA.
+/// * `options` - Local optimizer configuration.
+///
+/// # Returns
+///
+/// Returns a `LocalOptResult` with the optimization results.
+///
+/// # Note
+///
+/// Since NLOPT's `Nlopt` struct is `!Send` and `!Sync`, this function creates
+/// a fresh optimizer instance for each call. For parallel optimization, each
+/// thread should call this function independently. The objective must be
+/// `Sync` because gradient-based algorithms evaluate their finite-difference
+/// gradients in parallel.
+pub fn minimize_local<F, G>(
+    func: &F,
+    x0: &[f64],
+    bounds: &[(f64, f64)],
+    constraints: Option<&[G]>,
+    options: &LocalOptimizerOptions,
+) -> LocalOptResult
+where
+    F: Fn(&[f64]) -> f64 + Sync,
+    G: Fn(&[f64]) -> f64 + Sync,
+{
+    let cons: Vec<ScalarFn<'_>> = constraints
+        .map(|cs| cs.iter().map(|g| g as ScalarFn<'_>).collect())
+        .unwrap_or_default();
+    run_nlopt(func, x0, bounds, &cons, options)
+}
+
+/// Perform local minimization with constraints using NLOPT's constraint support.
+///
+/// This version adds inequality constraints to the optimizer for algorithms
+/// that support them (COBYLA, SLSQP); other algorithms are upgraded to COBYLA.
+///
+/// # Arguments
+///
+/// * `func` - The objective function to minimize.
+/// * `x0` - Initial guess for the optimization parameters.
+/// * `bounds` - Bounds for each dimension as (lower, upper) pairs.
+/// * `constraints` - Inequality constraints where g(x) >= 0 means feasible.
+/// * `options` - Local optimizer configuration.
+///
+/// # Returns
+///
+/// Returns a `LocalOptResult` with the optimization results.
+pub fn minimize_local_constrained<F>(
+    func: F,
+    x0: &[f64],
+    bounds: &[(f64, f64)],
+    constraints: &[BoxedConstraint],
+    options: &LocalOptimizerOptions,
+) -> LocalOptResult
+where
+    F: Fn(&[f64]) -> f64 + Sync,
+{
+    let cons: Vec<ScalarFn<'_>> = constraints.iter().map(|b| &**b as ScalarFn<'_>).collect();
+    run_nlopt(&func, x0, bounds, &cons, options)
 }
 
 #[cfg(test)]
@@ -573,6 +568,27 @@ mod tests {
         assert!(LocalOptimizer::Slsqp.requires_gradient());
         assert!(LocalOptimizer::Lbfgs.requires_gradient());
         assert!(!LocalOptimizer::Bobyqa.requires_gradient());
+    }
+
+    #[test]
+    fn test_fd_gradient_matches_analytic() {
+        let x = [0.7, -1.3, 2.0];
+        let bounds = [(-5.0, 5.0); 3];
+        let mut g = [0.0; 3];
+        let n = fd_gradient(&sphere, &x, sphere(&x), &bounds, &mut g);
+        assert_eq!(n, 3);
+        for (gi, xi) in g.iter().zip(x.iter()) {
+            assert_relative_eq!(*gi, 2.0 * xi, epsilon = 1e-5);
+        }
+        // At the upper bound the step must go backwards and stay in bounds.
+        let x = [5.0, 0.0];
+        let f = |v: &[f64]| {
+            assert!(v[0] <= 5.0, "finite-difference probe left the bounds");
+            sphere(v)
+        };
+        let mut g = [0.0; 2];
+        fd_gradient(&f, &x, sphere(&x), &[(-5.0, 5.0); 2], &mut g);
+        assert_relative_eq!(g[0], 10.0, epsilon = 1e-5);
     }
 
     #[test]
@@ -632,6 +648,31 @@ mod tests {
 
         assert!(result.success);
         assert_relative_eq!(result.fun, 0.0, epsilon = 1e-6);
+    }
+
+    /// Gradient-based algorithms must actually move (regression: they used to
+    /// receive no gradient and returned the starting point after one evaluation).
+    #[test]
+    fn test_minimize_gradient_based_moves() {
+        let bounds = vec![(-5.0, 5.0), (-5.0, 5.0)];
+        let x0 = vec![1.0, 1.0];
+        for alg in [LocalOptimizer::Slsqp, LocalOptimizer::Lbfgs] {
+            let options = LocalOptimizerOptions {
+                algorithm: alg,
+                ..Default::default()
+            };
+            let result = minimize_local(&sphere, &x0, &bounds, None::<&[fn(&[f64]) -> f64]>, &options);
+            assert!(result.success, "{:?} failed: {}", alg, result.message);
+            assert!(result.nfev > 1, "{:?} made only {} evaluation(s)", alg, result.nfev);
+            assert_relative_eq!(result.fun, 0.0, epsilon = 1e-8);
+            assert_relative_eq!(result.x[0], 0.0, epsilon = 1e-4);
+            assert_relative_eq!(result.x[1], 0.0, epsilon = 1e-4);
+
+            let result = minimize_local(&rosenbrock, &[-1.0, 2.0], &bounds, None::<&[fn(&[f64]) -> f64]>, &options);
+            assert!(result.success, "{:?} failed: {}", alg, result.message);
+            assert_relative_eq!(result.x[0], 1.0, epsilon = 1e-2);
+            assert_relative_eq!(result.x[1], 1.0, epsilon = 1e-2);
+        }
     }
 
     #[test]
@@ -718,24 +759,45 @@ mod tests {
         }
     }
 
+    /// Constraints passed to the public `minimize_local` must be honoured
+    /// (regression: they used to be silently dropped, returning the
+    /// unconstrained minimum).
     #[test]
     fn test_minimize_constrained_fallback() {
         // When using BOBYQA with constraints, should fall back to COBYLA
         let bounds = vec![(0.0, 2.0), (0.0, 2.0)];
         let x0 = vec![1.5, 1.5];
 
-        // Constraint: x[0] + x[1] >= 1
+        // Constraint: x[0] + x[1] >= 1  -> constrained optimum (0.5, 0.5), f = 0.5
         let constraints = [|x: &[f64]| x[0] + x[1] - 1.0];
 
-        let options = LocalOptimizerOptions {
-            algorithm: LocalOptimizer::Bobyqa, // Doesn't support constraints
-            ..Default::default()
-        };
+        for alg in [LocalOptimizer::Bobyqa, LocalOptimizer::Cobyla, LocalOptimizer::Slsqp] {
+            let options = LocalOptimizerOptions {
+                algorithm: alg,
+                ..Default::default()
+            };
+            let result = minimize_local(&sphere, &x0, &bounds, Some(&constraints[..]), &options);
+            assert!(result.success, "{:?}: {}", alg, result.message);
+            let g = result.x[0] + result.x[1] - 1.0;
+            assert!(g >= -1e-6, "{:?} violated the constraint: g = {}", alg, g);
+            assert_relative_eq!(result.fun, 0.5, epsilon = 1e-4);
+        }
+    }
 
-        let result = minimize_local(&sphere, &x0, &bounds, Some(&constraints[..]), &options);
-
-        // Should have fallen back to COBYLA
-        assert!(result.success);
+    #[test]
+    fn test_minimize_local_constrained_boxed() {
+        let bounds = vec![(0.0, 2.0), (0.0, 2.0)];
+        let constraints: Vec<BoxedConstraint> = vec![Box::new(|x: &[f64]| x[0] + x[1] - 1.0)];
+        for alg in [LocalOptimizer::Cobyla, LocalOptimizer::Slsqp] {
+            let options = LocalOptimizerOptions {
+                algorithm: alg,
+                ..Default::default()
+            };
+            let result = minimize_local_constrained(sphere, &[1.5, 1.5], &bounds, &constraints, &options);
+            assert!(result.success, "{:?}: {}", alg, result.message);
+            assert!(result.x[0] + result.x[1] - 1.0 >= -1e-6, "{:?} violated the constraint", alg);
+            assert_relative_eq!(result.fun, 0.5, epsilon = 1e-4);
+        }
     }
 
     #[test]
@@ -746,11 +808,12 @@ mod tests {
         let algorithms = [
             LocalOptimizer::Bobyqa,
             LocalOptimizer::Cobyla,
+            LocalOptimizer::Slsqp,
+            LocalOptimizer::Lbfgs,
             LocalOptimizer::NelderMead,
             LocalOptimizer::Praxis,
             LocalOptimizer::NewuoaBound,
             LocalOptimizer::Sbplx,
-            // Skip SLSQP and LBFGS as they require gradients
         ];
 
         for alg in algorithms {

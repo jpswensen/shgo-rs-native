@@ -31,7 +31,7 @@
 //! cache.process_pools();
 //! ```
 
-use std::collections::HashSet;
+use std::collections::BTreeSet;
 use std::sync::atomic::{AtomicU8, AtomicUsize, Ordering};
 use std::sync::Arc;
 
@@ -77,9 +77,12 @@ pub struct Vertex {
     /// Unique index of this vertex in the cache.
     index: usize,
 
-    /// Set of indices of neighboring vertices.
-    /// Using indices rather than references avoids lifetime complexity.
-    neighbors: RwLock<HashSet<usize>>,
+    /// Set of indices of neighboring vertices, kept in ascending index order.
+    /// Using indices rather than references avoids lifetime complexity; the
+    /// ordered set makes every neighbor traversal deterministic (a `HashSet`
+    /// here made simplicial refinement — which queues sub-regions in
+    /// neighbor order — differ from run to run).
+    neighbors: RwLock<BTreeSet<usize>>,
 
     /// The objective function value at this vertex.
     /// `None` if not yet evaluated, `Some(f64::INFINITY)` if infeasible.
@@ -117,7 +120,7 @@ impl Vertex {
         Self {
             coordinates: Coordinates::new(coords),
             index,
-            neighbors: RwLock::new(HashSet::new()),
+            neighbors: RwLock::new(BTreeSet::new()),
             f: RwLock::new(None),
             feasible: RwLock::new(None),
             cached_min: AtomicU8::new(CACHE_NEEDS_RECHECK),
@@ -130,7 +133,7 @@ impl Vertex {
         Self {
             coordinates,
             index,
-            neighbors: RwLock::new(HashSet::new()),
+            neighbors: RwLock::new(BTreeSet::new()),
             f: RwLock::new(None),
             feasible: RwLock::new(None),
             cached_min: AtomicU8::new(CACHE_NEEDS_RECHECK),
@@ -187,7 +190,7 @@ impl Vertex {
         self.f.read().is_some()
     }
 
-    /// Get the set of neighbor indices.
+    /// Get the neighbor indices in ascending order (deterministic).
     pub fn neighbor_indices(&self) -> Vec<usize> {
         self.neighbors.read().iter().copied().collect()
     }
