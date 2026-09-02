@@ -137,7 +137,12 @@ fit a local-run budget (Sobol + KNN only; the curve and chosen k come back in
 `max_candidates_by_persistence` prune the pool by basin persistence — breadth knobs
 that can drop the basin which would have polished deepest, so they never prune the
 lowest-cost candidate. `explore_from_known_minima` restores the pre-fix behaviour of
-re-minimizing from found minima; measured as not worth it (README has the numbers). `iters: None` without any other stopping criterion is rejected
+re-minimizing from found minima; measured as not worth it (README has the numbers).
+`robustness_probe` / `robust_polish` (extensions, off by default) evaluate a
+deterministic stencil around each retained minimum after optimization and can
+re-optimize the best ones on the stencil-averaged objective; results land in
+`ShgoResult::robustness` / `robust_minima`, evaluations in `nfev`, the raw answer
+is untouched. `iters: None` without any other stopping criterion is rejected
 with `InvalidOption` (it would loop forever). Intentional deviation: Sobol iteration i
 continues the sequence at index `i·n` — SciPy draws `i·n` fresh points and triangulates
 only the tail, so multi-iteration Sobol runs never match SciPy point-for-point.

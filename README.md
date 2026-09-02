@@ -169,6 +169,8 @@ for (i, (x, f)) in result.xl.iter().zip(result.funl.iter()).enumerate() {
 | `min_candidate_persistence` | `Option<f64>` | `None` | Drop candidates whose basin persistence is at or below this, before any local run |
 | `max_candidates_by_persistence` | `Option<usize>` | `None` | Keep at most this many candidates, most persistent first |
 | `explore_from_known_minima` | `bool` | `false` | Also re-run the local optimizer from already-found minima (see below) |
+| `robustness_probe` | `Option<RobustnessProbe>` | `None` | After optimization, measure each retained minimum's sensitivity to parameter perturbations on a deterministic stencil |
+| `robust_polish` | `Option<RobustPolish>` | `None` | Re-optimize the best minima on the stencil-smoothed objective; results in `robust_minima` |
 | `f_min` + `f_tol` | — | — | Precision-based early stopping |
 
 `iters: None` is only accepted together with another stopping criterion
@@ -217,6 +219,39 @@ prominent one. On a 2^d-well test function with 16384 points in 8 dimensions it
 ranked 231st of 246 basins by persistence. Treat these as breadth-of-map knobs,
 keep any threshold near the objective's noise floor, and do not rely on them to
 preserve the global optimum.
+
+### Robustness to parameter perturbations
+
+Two opt-in post-optimization steps for problems whose answer must survive
+small parameter changes. Both use the same deterministic stencil around a
+point — the `2·dim` axis steps at a relative radius plus a small Sobol cloud in
+that box, clipped to the bounds, with constraint-violating points skipped —
+and both add their evaluations to `nfev` while leaving `x`, `fun`, `xl` and
+`funl` untouched.
+
+```rust
+use shgo::{RobustnessProbe, RobustPolish, ShgoOptions};
+
+let options = ShgoOptions {
+    // 3 % of each parameter's range, 8 Sobol points besides the axis steps
+    robustness_probe: Some(RobustnessProbe::new(0.03, 8)),
+    // re-optimize the 3 most robust minima on the stencil-averaged objective
+    robust_polish: Some(RobustPolish::new(0.03, 8, 3)),
+    ..Default::default()
+};
+// result.robustness[i]: f_center, robust_value (mean by default; Max and CVaR
+//   available), f_mean, f_max, f_std, worst_axis, n_feasible ...
+// result.robust_minima: x, robust_value, f_center per polished minimum
+```
+
+The probe is a **polished-point** measurement. The basin statistics
+(`compute_basin_stats`) describe the sampled cloud's catchments instead, and at
+realistic densities a basin's members are few and mostly far from its minimum:
+on a four-basin test at 8 192 points in 4 dimensions every basin's `f_median`
+was within 4e-4 of zero, while the probe ranked the basins by their actual
+widths and named the fragile axis. Use the cloud statistics for "how much of
+the space drains here", and the probe for "what happens if these parameters
+wobble".
 
 ### `explore_from_known_minima`
 
