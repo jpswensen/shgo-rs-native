@@ -18,7 +18,7 @@ examples that write `use shgo_rs::…` fail to compile as doctests.
 
 ```bash
 cargo build --release              # fat LTO + codegen-units=1: slow link, expected
-cargo test                         # 114 unit + 11 cross-validation + 21 doctests, all green
+cargo test                         # 125 unit + 11 cross-validation + 21 doctests, all green
 cargo test --release <test_name>   # run a single test by substring
 cargo test --test cross_validation # Rust vs Python fixture comparison only
 cargo bench                        # criterion benchmarks (benches/benchmarks.rs)
