@@ -130,7 +130,14 @@ entry) are skipped, mirroring SciPy's `minimizers()` check against `LMC.xl_maps`
 without it every minimum re-inserted into the next Sobol iteration was re-minimized.
 `xl`/`funl` are de-duplicated with `xl_dedup_rtol` (relative to bounds width) and
 `xl_dedup_ftol`; SciPy keeps one row per start point (set `xl_dedup_rtol = 0` for
-bitwise-only merging). `iters: None` without any other stopping criterion is rejected
+bitwise-only merging). Two optional pool controls (extensions, both off by default,
+both costing zero objective evaluations): `knn_auto` picks k from the `|M_k|` curve to
+fit a local-run budget (Sobol + KNN only; the curve and chosen k come back in
+`ShgoResult::knn_selection`), and `min_candidate_persistence` /
+`max_candidates_by_persistence` prune the pool by basin persistence — breadth knobs
+that can drop the basin which would have polished deepest, so they never prune the
+lowest-cost candidate. `explore_from_known_minima` restores the pre-fix behaviour of
+re-minimizing from found minima; measured as not worth it (README has the numbers). `iters: None` without any other stopping criterion is rejected
 with `InvalidOption` (it would loop forever). Intentional deviation: Sobol iteration i
 continues the sequence at index `i·n` — SciPy draws `i·n` fresh points and triangulates
 only the tail, so multi-iteration Sobol runs never match SciPy point-for-point.

@@ -277,6 +277,112 @@ pub struct ShgoOptions {
     /// merging distinct minima that happen to be close in badly scaled
     /// dimensions. `0.0` disables the function-value check. Default: 1e-6.
     pub xl_dedup_ftol: f64,
+
+    /// Choose the k-nearest-neighbour count from the minimizer-pool curve
+    /// instead of using a fixed [`ShgoOptions::knn_neighbors`].
+    ///
+    /// Only honoured for [`ConnectivityMethod::KNearestNeighbors`] (the other
+    /// methods ignore it, with a warning at `disp > 0`). Costs one neighbour
+    /// pass and **zero objective evaluations**: the number of minimizer
+    /// candidates `|M_k|` is non-increasing in k, so a single sorted-neighbour
+    /// computation yields the whole curve and the smallest k that fits the
+    /// requested budget. See [`KnnAuto`]. Default: `None`.
+    pub knn_auto: Option<KnnAuto>,
+
+    /// Drop minimizer candidates whose basin persistence is at or below this
+    /// value, before any local minimization runs.
+    ///
+    /// Persistence is the cost gap between a basin's lowest sampled vertex and
+    /// the saddle at which that basin merges into a deeper one (the global
+    /// basin has infinite persistence and is never dropped). A candidate with
+    /// persistence below the objective's noise level is a sampling artefact
+    /// rather than a distinct basin, so this prunes redundant local runs
+    /// without the recall loss that raising k causes. Costs `O(V·k)`
+    /// arithmetic and zero objective evaluations. Extension — SciPy has no
+    /// equivalent. Default: `None`.
+    ///
+    /// **Caveat.** Persistence describes the *sampled* landscape. When the
+    /// sampling is coarse relative to the number of minima, the basin that
+    /// polishes to the global optimum need not be a prominent one: on a
+    /// 2^d-well test function with 16384 points in 8 dimensions it ranked
+    /// 231st of 246 basins by persistence. Keep the threshold near the
+    /// objective's noise floor, and prefer this over
+    /// [`ShgoOptions::max_candidates_by_persistence`] when the global optimum
+    /// matters more than the breadth of the map. The lowest-cost candidate is
+    /// never pruned by either filter.
+    pub min_candidate_persistence: Option<f64>,
+
+    /// Keep at most this many minimizer candidates per iteration, choosing the
+    /// most persistent (see [`ShgoOptions::min_candidate_persistence`]).
+    ///
+    /// Unlike [`ShgoOptions::maxiter_local`], which keeps the candidates with
+    /// the lowest sampled cost, this keeps the ones most likely to be distinct
+    /// basins. Applied after `min_candidate_persistence` and before
+    /// `maxiter_local`. The lowest-cost candidate is always kept. Default:
+    /// `None`.
+    ///
+    /// **This is a breadth-of-map knob, not a global-optimum knob** — see the
+    /// caveat on [`ShgoOptions::min_candidate_persistence`]. Truncating a
+    /// coarsely sampled landscape to its most prominent basins can discard the
+    /// basin that would have polished deepest.
+    pub max_candidates_by_persistence: Option<usize>,
+
+    /// Also start a local minimization from sampling points that sit on an
+    /// already-found minimum, instead of skipping them.
+    ///
+    /// Every minimum re-inserted into the next Sobol iteration is a graph
+    /// minimizer by construction, so this re-runs the local optimizer from
+    /// each known minimum once per iteration. With a derivative-free method
+    /// whose initial trust region is a fraction of the box (BOBYQA, the
+    /// default) such a run sometimes leaves the basin and lands in a deeper
+    /// neighbouring one, which makes this a crude restart heuristic — at the
+    /// cost of one full local run per known minimum per iteration, and of
+    /// SciPy parity (its `minimizers()` skips these vertices). Default:
+    /// `false`.
+    pub explore_from_known_minima: bool,
+}
+
+/// Budget-driven automatic choice of the k-nearest-neighbour count.
+///
+/// The number of minimizer candidates `|M_k|` is non-increasing in k, and each
+/// candidate costs one local minimization, so k is really a dial on the local
+/// search budget. This picks the smallest k whose candidate count fits
+/// `max_local_runs`, which keeps the sampling graph as sparse (and therefore as
+/// sensitive to shallow basins) as the budget allows.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct KnnAuto {
+    /// Target ceiling on the number of local minimizations per iteration.
+    pub max_local_runs: usize,
+    /// Largest k to consider. `None` = `max(4·dim, 64)`, capped at `n - 1`.
+    pub k_max: Option<usize>,
+    /// Smallest k to consider. `None` = `dim + 1`. Raising this guards against
+    /// a degenerate curve on a nearly flat objective.
+    pub k_min: Option<usize>,
+}
+
+impl KnnAuto {
+    /// Auto-select k with the given ceiling on local minimizations per
+    /// iteration and default k bounds.
+    pub fn with_budget(max_local_runs: usize) -> Self {
+        Self {
+            max_local_runs,
+            k_max: None,
+            k_min: None,
+        }
+    }
+}
+
+/// Outcome of one automatic k selection (see [`ShgoOptions::knn_auto`]).
+#[derive(Debug, Clone)]
+pub struct KnnSelection {
+    /// The k that was used to build the sampling graph.
+    pub k: usize,
+    /// The largest k considered.
+    pub k_max: usize,
+    /// `curve[k]` is the number of minimizer candidates the graph would have
+    /// at that k, for `k` in `0..=k_max`. Non-increasing. `curve[0]` is the
+    /// number of feasible sampled points.
+    pub curve: Vec<usize>,
 }
 
 impl Default for ShgoOptions {
@@ -308,6 +414,10 @@ impl Default for ShgoOptions {
             basin_tail_fraction: 0.1,
             xl_dedup_rtol: 1e-4,
             xl_dedup_ftol: 1e-6,
+            knn_auto: None,
+            min_candidate_persistence: None,
+            max_candidates_by_persistence: None,
+            explore_from_known_minima: false,
         }
     }
 }
@@ -390,6 +500,10 @@ pub struct ShgoResult {
     /// Per-basin statistics of the sampled cloud (only when
     /// `ShgoOptions::compute_basin_stats` is set).
     pub basins: Option<Vec<BasinStats>>,
+    /// The k chosen by [`ShgoOptions::knn_auto`] and the candidate-count curve
+    /// it was chosen from, for the most recent iteration. `None` when
+    /// automatic selection was not used.
+    pub knn_selection: Option<KnnSelection>,
 }
 
 impl ShgoResult {
@@ -407,6 +521,7 @@ impl ShgoResult {
             nlfev: 0,
             time: 0.0,
             basins: None,
+            knn_selection: None,
         }
     }
 }
@@ -476,11 +591,92 @@ impl Default for LMapCache {
     }
 }
 
+/// 0-dimensional persistence of every basin in an evaluated vertex cloud: for
+/// each graph minimizer, the cost gap between it and the saddle at which its
+/// basin merges into an older (lower) one. Basins that never merge — the
+/// global one, and any component isolated in the sampling graph — are absent
+/// from the map; callers read that as infinite persistence.
+///
+/// Vertices are swept in ascending `(f, index)`; a union-find with the elder
+/// rule records each younger basin's death. `fs[i]` is the value at
+/// `vertices[i]`, and `vertices[i].index() == i` (the vertex-cache invariant),
+/// so map keys are vertex indices. Deterministic.
+fn compute_persistence(
+    vertices: &[Arc<crate::Vertex>],
+    fs: &[f64],
+    finite: &[bool],
+) -> std::collections::HashMap<usize, f64> {
+    use std::collections::HashMap;
+
+    let n = vertices.len();
+    let lower = |a: usize, b: usize| (fs[a], a) < (fs[b], b);
+
+    fn find(uf: &mut [usize], mut x: usize) -> usize {
+        while uf[x] != x {
+            uf[x] = uf[uf[x]];
+            x = uf[x];
+        }
+        x
+    }
+
+    let mut order: Vec<usize> = (0..n).filter(|&i| finite[i]).collect();
+    order.sort_by(|&a, &b| {
+        fs[a]
+            .partial_cmp(&fs[b])
+            .unwrap_or(std::cmp::Ordering::Equal)
+            .then(a.cmp(&b))
+    });
+    let mut uf: Vec<usize> = (0..n).collect();
+    // A component's union-find root is always its `(f, index)`-minimal vertex
+    // (merges always point the younger root at the elder), so `comp_min[r] == r`.
+    let comp_min: Vec<usize> = (0..n).collect();
+    let mut processed = vec![false; n];
+    let mut persistence: HashMap<usize, f64> = HashMap::new();
+    for &v in &order {
+        processed[v] = true;
+        for &nb in &vertices[v].neighbor_indices() {
+            if nb >= n || !processed[nb] {
+                continue;
+            }
+            let rv = find(&mut uf, v);
+            let rn = find(&mut uf, nb);
+            if rv == rn {
+                continue;
+            }
+            let (elder, younger) = if lower(comp_min[rv], comp_min[rn]) {
+                (rv, rn)
+            } else {
+                (rn, rv)
+            };
+            persistence.insert(comp_min[younger], fs[v] - fs[comp_min[younger]]);
+            uf[younger] = elder;
+        }
+    }
+    persistence
+}
+
+/// [`compute_persistence`] over a whole vertex cache.
+fn persistence_map<F2, G2>(
+    cache: &crate::vertex::VertexCache<F2, G2>,
+) -> std::collections::HashMap<usize, f64>
+where
+    F2: Fn(&[f64]) -> f64 + Send + Sync,
+    G2: Fn(&[f64]) -> bool + Send + Sync,
+{
+    let vertices: Vec<Arc<crate::Vertex>> = cache.iter().collect();
+    let fs: Vec<f64> = vertices
+        .iter()
+        .map(|v| v.f().unwrap_or(f64::INFINITY))
+        .collect();
+    let finite: Vec<bool> = fs.iter().map(|f| f.is_finite()).collect();
+    compute_persistence(&vertices, &fs, &finite)
+}
+
 /// Compute per-basin statistics over an evaluated vertex cache.
 ///
 /// Steepest-descent labeling under the total order (f, index) assigns each
-/// finite vertex to a graph minimizer; a union-find sweep in ascending order
-/// computes persistence with the elder rule. Deterministic.
+/// finite vertex to a graph minimizer; [`compute_persistence`] supplies the
+/// persistence of each. Deterministic.
 fn compute_basin_statistics<F2, G2>(
     cache: &crate::vertex::VertexCache<F2, G2>,
     lmap_cache: &LMapCache,
@@ -539,46 +735,9 @@ where
         root[i] = r;
     }
 
-    // Persistence: process vertices in ascending (f, index); merging a
-    // younger component (higher minimum) into an elder one records the
-    // younger basin's death at the current cost.
-    fn find(uf: &mut [usize], mut x: usize) -> usize {
-        while uf[x] != x {
-            uf[x] = uf[uf[x]];
-            x = uf[x];
-        }
-        x
-    }
-    let mut order: Vec<usize> = (0..n).filter(|&i| finite[i]).collect();
-    order.sort_by(|&a, &b| {
-        fs[a].partial_cmp(&fs[b])
-            .unwrap_or(std::cmp::Ordering::Equal)
-            .then(a.cmp(&b))
-    });
-    let mut uf: Vec<usize> = (0..n).collect();
-    let comp_min: Vec<usize> = (0..n).collect();
-    let mut processed = vec![false; n];
-    let mut persistence: HashMap<usize, f64> = HashMap::new();
-    for &v in &order {
-        processed[v] = true;
-        for &nb in &vertices[v].neighbor_indices() {
-            if nb >= n || !processed[nb] {
-                continue;
-            }
-            let rv = find(&mut uf, v);
-            let rn = find(&mut uf, nb);
-            if rv == rn {
-                continue;
-            }
-            let (elder, younger) = if lower(comp_min[rv], comp_min[rn]) {
-                (rv, rn)
-            } else {
-                (rn, rv)
-            };
-            persistence.insert(comp_min[younger], fs[v] - fs[comp_min[younger]]);
-            uf[younger] = elder;
-        }
-    }
+    // Persistence: merging a younger component (higher minimum) into an elder
+    // one records the younger basin's death at the current cost.
+    let persistence = compute_persistence(&vertices, &fs, &finite);
 
     // Aggregate member costs per basin root.
     let mut members: HashMap<usize, Vec<f64>> = HashMap::new();
@@ -874,6 +1033,98 @@ where
         xl.iter().any(|m| self.within_x_tolerance(x, m))
     }
 
+    /// Whether the persistence of each candidate has to be known this
+    /// iteration (i.e. whether either persistence-based filter is active).
+    fn needs_candidate_persistence(&self) -> bool {
+        self.options.min_candidate_persistence.is_some()
+            || self.options.max_candidates_by_persistence.is_some()
+    }
+
+    /// Turn the graph minimizers into the pool of local-minimization starting
+    /// points: drop infeasible vertices, ones already minimized from, and ones
+    /// sitting on an already-found minimum; optionally prune by basin
+    /// persistence; then sort by function value and trim to `maxiter_local`
+    /// (SciPy's `sort_min_pool` + `local_iter`).
+    fn select_candidates<'a>(
+        &self,
+        minimizers: &'a [Arc<crate::Vertex>],
+        lmap_cache: &LMapCache,
+        xl: &[Vec<f64>],
+        persistence: Option<&std::collections::HashMap<usize, f64>>,
+    ) -> Vec<&'a Arc<crate::Vertex>> {
+        let mut candidates: Vec<&Arc<crate::Vertex>> = minimizers
+            .iter()
+            .filter(|v| v.feasible() != Some(false))
+            .filter(|v| {
+                !lmap_cache.contains(&Coordinates::new(v.coordinates().as_slice().to_vec()))
+            })
+            .filter(|v| {
+                self.options.explore_from_known_minima || !self.near_known_minimum(v.x(), xl)
+            })
+            .collect();
+
+        if let Some(pers) = persistence {
+            // A candidate with no recorded death never merged into a deeper
+            // basin, so its persistence is infinite and it is never pruned.
+            let p = |v: &Arc<crate::Vertex>| {
+                pers.get(&v.index()).copied().unwrap_or(f64::INFINITY)
+            };
+            let before = candidates.len();
+            // The lowest-cost candidate is never pruned: SciPy's
+            // `minimise_pool` always minimizes `X_min[0]` before any trimming,
+            // and it is the single most likely start to reach the optimum.
+            let best = candidates
+                .iter()
+                .enumerate()
+                .min_by(|(ia, a), (ib, b)| {
+                    a.f()
+                        .unwrap_or(f64::INFINITY)
+                        .partial_cmp(&b.f().unwrap_or(f64::INFINITY))
+                        .unwrap_or(std::cmp::Ordering::Equal)
+                        .then(ia.cmp(ib))
+                })
+                .map(|(_, v)| v.index());
+            let is_best = |v: &Arc<crate::Vertex>| Some(v.index()) == best;
+            if let Some(min_p) = self.options.min_candidate_persistence {
+                candidates.retain(|v| p(v) > min_p || is_best(v));
+            }
+            if let Some(top) = self.options.max_candidates_by_persistence {
+                if candidates.len() > top {
+                    candidates.sort_by(|a, b| {
+                        is_best(b)
+                            .cmp(&is_best(a))
+                            .then(
+                                p(b).partial_cmp(&p(a))
+                                    .unwrap_or(std::cmp::Ordering::Equal),
+                            )
+                            .then(a.index().cmp(&b.index()))
+                    });
+                    candidates.truncate(top.max(1));
+                }
+            }
+            if self.options.disp > 1 {
+                println!(
+                    "  persistence pruning: {} -> {} candidates",
+                    before,
+                    candidates.len()
+                );
+            }
+        }
+
+        // SciPy sorts the minimizer pool by function value (sort_min_pool)
+        // before trimming to `local_iter` candidates, so truncation keeps the
+        // most promising starts. Ties break by vertex index for determinism.
+        candidates.sort_by(|a, b| {
+            a.f()
+                .unwrap_or(f64::INFINITY)
+                .partial_cmp(&b.f().unwrap_or(f64::INFINITY))
+                .unwrap_or(std::cmp::Ordering::Equal)
+                .then(a.index().cmp(&b.index()))
+        });
+        candidates.truncate(self.options.maxiter_local.unwrap_or(usize::MAX));
+        candidates
+    }
+
     /// Internal minimize implementation.
     fn minimize_inner(&self) -> Result<ShgoResult, ShgoError> {
         let start_time = Instant::now();
@@ -899,6 +1150,16 @@ where
 
         // Initialize result
         let mut result = ShgoResult::new(self.dim);
+
+        if self.options.knn_auto.is_some()
+            && !(self.options.sampling_method == SamplingMethod::Sobol
+                && self.options.connectivity_method == ConnectivityMethod::KNearestNeighbors)
+        {
+            return Err(ShgoError::InvalidOption(
+                "knn_auto requires sampling_method = Sobol with connectivity_method = KNearestNeighbors"
+                    .into(),
+            ));
+        }
 
         // Run based on sampling method
         match self.options.sampling_method {
@@ -1078,31 +1339,17 @@ where
             // Pre-compute all LCBs from the (read-only) complex, then dispatch
             // all local minimizations concurrently via rayon.
             if self.options.minimize_every_iter {
-                let maxiter_local = self.options.maxiter_local.unwrap_or(usize::MAX);
-
-                // Collect candidates: feasible, not already in LMC, and not
-                // sitting on a minimum that a previous local run already found
-                // (SciPy's `minimizers()` skips vertices at `LMC.xl_maps`).
-                let mut candidates: Vec<_> = minimizers
-                    .iter()
-                    .filter(|v| v.feasible() != Some(false))
-                    .filter(|v| {
-                        !lmap_cache.contains(&Coordinates::new(
-                            v.coordinates().as_slice().to_vec(),
-                        ))
-                    })
-                    .filter(|v| !self.near_known_minimum(v.x(), &result.xl))
-                    .collect();
-                // SciPy sorts the minimizer pool by function value
-                // (sort_min_pool) before trimming to `local_iter` candidates,
-                // so truncation keeps the most promising starts.
-                candidates.sort_by(|a, b| {
-                    a.f()
-                        .unwrap_or(f64::INFINITY)
-                        .partial_cmp(&b.f().unwrap_or(f64::INFINITY))
-                        .unwrap_or(std::cmp::Ordering::Equal)
-                });
-                candidates.truncate(maxiter_local);
+                let persistence = if self.needs_candidate_persistence() {
+                    Some(persistence_map(&complex.cache))
+                } else {
+                    None
+                };
+                let candidates = self.select_candidates(
+                    &minimizers,
+                    &lmap_cache,
+                    &result.xl,
+                    persistence.as_ref(),
+                );
 
                 if !candidates.is_empty() {
                     // Pre-compute starting points and locally convex bounds
@@ -1312,6 +1559,11 @@ where
                 cache.get_or_create(p.clone());
             }
 
+            // Process pending evaluations (constraints, then function values)
+            // BEFORE building connectivity: nothing in the graph construction
+            // depends on them except automatic k selection, which needs them.
+            cache.process_pools();
+
             // ---- Build vertex connectivity ----
             // All methods build the graph over the FULL cumulative point
             // cloud, matching SciPy's semantics of re-triangulating all
@@ -1363,15 +1615,31 @@ where
                                 true,
                             )?;
                         }
-                        ConnectivityMethod::KNearestNeighbors => {
-                            Self::build_knn_connectivity(
-                                &all_points,
-                                &all_vertices,
-                                self.dim,
-                                self.options.knn_neighbors,
-                                self.options.disp,
-                            );
-                        }
+                        ConnectivityMethod::KNearestNeighbors => match self.options.knn_auto {
+                            Some(auto) => {
+                                let fs: Vec<f64> = all_vertices
+                                    .iter()
+                                    .map(|v| v.f().unwrap_or(f64::INFINITY))
+                                    .collect();
+                                result.knn_selection = Some(Self::build_knn_connectivity_auto(
+                                    &all_points,
+                                    &all_vertices,
+                                    &fs,
+                                    self.dim,
+                                    auto,
+                                    self.options.disp,
+                                ));
+                            }
+                            None => {
+                                Self::build_knn_connectivity(
+                                    &all_points,
+                                    &all_vertices,
+                                    self.dim,
+                                    self.options.knn_neighbors,
+                                    self.options.disp,
+                                );
+                            }
+                        },
                         ConnectivityMethod::HNSW => {
                             Self::build_hnsw_connectivity(
                                 &all_points,
@@ -1394,35 +1662,23 @@ where
                 }
             }
 
-            // Process pending evaluations (function values + constraints)
-            cache.process_pools();
-
             // Find minimizers using topological analysis
-            // (now with Delaunay connectivity, f(v) < f(all neighbors) works correctly)
+            // (f(v) < f(all neighbors) over the sampling graph)
             let minimizers = cache.find_all_minimizers();
             
             // Process minimizers with local optimization
             if self.options.minimize_every_iter {
-                // Filter to feasible vertices, not in LMC, not on a known
-                // minimum (re-inserted minima are graph minimizers by
-                // construction and must not be re-minimized every iteration),
-                // limited count
-                let maxiter_local = self.options.maxiter_local.unwrap_or(usize::MAX);
-                let mut candidates: Vec<_> = minimizers
-                    .iter()
-                    .filter(|v| v.feasible() != Some(false))
-                    .filter(|v| !lmap_cache.contains(&Coordinates::new(v.coordinates().as_slice().to_vec())))
-                    .filter(|v| !self.near_known_minimum(v.x(), &result.xl))
-                    .collect();
-                // SciPy sorts the minimizer pool by function value
-                // (sort_min_pool) before trimming to `local_iter` candidates.
-                candidates.sort_by(|a, b| {
-                    a.f()
-                        .unwrap_or(f64::INFINITY)
-                        .partial_cmp(&b.f().unwrap_or(f64::INFINITY))
-                        .unwrap_or(std::cmp::Ordering::Equal)
-                });
-                candidates.truncate(maxiter_local);
+                let persistence = if self.needs_candidate_persistence() {
+                    Some(persistence_map(&cache))
+                } else {
+                    None
+                };
+                let candidates = self.select_candidates(
+                    &minimizers,
+                    &lmap_cache,
+                    &result.xl,
+                    persistence.as_ref(),
+                );
 
                 // Local minimization with GLOBAL bounds in parallel
                 // (matching Python's construct_lcb_delaunay which returns global bounds
@@ -1661,6 +1917,139 @@ where
                 k, n, avg_neighbors
             );
         }
+    }
+
+    /// Build k-NN connectivity with k chosen from the minimizer-pool curve.
+    ///
+    /// One pass computes, for every point, its `k_max` nearest neighbours in
+    /// distance order. An undirected edge's rank is the smaller of the two
+    /// directed ranks, so it is present in the symmetrized k-NN graph exactly
+    /// when `rank <= k`; a vertex is a minimizer at k exactly when no incident
+    /// edge of rank `<= k` leads to a vertex that is not strictly higher. The
+    /// whole curve `|M_k|` therefore falls out of one neighbour computation
+    /// and no objective evaluations, and k is picked as the smallest value
+    /// whose candidate count fits the caller's budget.
+    ///
+    /// Requires the objective values in `fs` (index-aligned with `points`), so
+    /// the caller must have processed the evaluation pools first. Ties in
+    /// distance break by point index, so the result is deterministic.
+    fn build_knn_connectivity_auto(
+        points: &[Vec<f64>],
+        vertices: &[std::sync::Arc<crate::Vertex>],
+        fs: &[f64],
+        dim: usize,
+        auto: KnnAuto,
+        disp: usize,
+    ) -> KnnSelection {
+        let n = points.len();
+        if n < 2 {
+            return KnnSelection {
+                k: 0,
+                k_max: 0,
+                curve: vec![n],
+            };
+        }
+        let k_max = auto
+            .k_max
+            .unwrap_or_else(|| (4 * dim).max(64))
+            .min(n - 1)
+            .max(1);
+        let k_min = auto.k_min.unwrap_or(dim + 1).clamp(1, k_max);
+
+        // Directed (point, neighbour, rank) triples, ranked by (distance, index).
+        let mut edges: Vec<(u32, u32, u32)> = (0..n)
+            .into_par_iter()
+            .flat_map_iter(|i| {
+                let mut d: Vec<(f64, u32)> = (0..n)
+                    .filter(|&j| j != i)
+                    .map(|j| {
+                        let d2: f64 = points[i]
+                            .iter()
+                            .zip(points[j].iter())
+                            .map(|(a, b)| (a - b).powi(2))
+                            .sum();
+                        (d2, j as u32)
+                    })
+                    .collect();
+                if d.len() > k_max {
+                    d.select_nth_unstable_by(k_max - 1, |a, b| {
+                        a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal)
+                    });
+                    d.truncate(k_max);
+                }
+                d.sort_unstable_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+                let iu = i as u32;
+                d.into_iter()
+                    .enumerate()
+                    .map(move |(rank, (_, j))| {
+                        (iu.min(j), iu.max(j), rank as u32 + 1)
+                    })
+                    .collect::<Vec<_>>()
+            })
+            .collect();
+
+        // Symmetrize: keep the smaller of the two directed ranks per pair.
+        edges.par_sort_unstable();
+        edges.dedup_by(|a, b| a.0 == b.0 && a.1 == b.1);
+
+        // m[v] = smallest k at which some neighbour disqualifies v as a
+        // minimizer (a neighbour u disqualifies v when !(f_v < f_u)).
+        let mut m = vec![u32::MAX; n];
+        for &(a, b, r) in &edges {
+            let (a, b) = (a as usize, b as usize);
+            if fs[b] <= fs[a] {
+                m[a] = m[a].min(r);
+            }
+            if fs[a] <= fs[b] {
+                m[b] = m[b].min(r);
+            }
+        }
+
+        let mut hist = vec![0usize; k_max + 2];
+        let mut total = 0usize;
+        for (i, &mi) in m.iter().enumerate() {
+            if !fs[i].is_finite() {
+                continue; // infeasible points are never minimizers
+            }
+            total += 1;
+            let bucket = if mi == u32::MAX {
+                k_max + 1
+            } else {
+                (mi as usize).min(k_max + 1)
+            };
+            hist[bucket] += 1;
+        }
+        let mut curve = vec![0usize; k_max + 1];
+        let mut removed = 0usize;
+        for (k, slot) in curve.iter_mut().enumerate() {
+            if k >= 1 {
+                removed += hist[k];
+            }
+            *slot = total - removed;
+        }
+
+        let k = (k_min..=k_max)
+            .find(|&cand| curve[cand] <= auto.max_local_runs)
+            .unwrap_or(k_max);
+
+        edges
+            .par_iter()
+            .filter(|&&(_, _, r)| (r as usize) <= k)
+            .for_each(|&(a, b, _)| {
+                crate::Vertex::connect_bidirectional(
+                    &vertices[a as usize],
+                    &vertices[b as usize],
+                );
+            });
+
+        if disp > 0 {
+            println!(
+                "  k-NN auto: k={} (budget {} local runs, |M_k|={}, k range {}..={})",
+                k, auto.max_local_runs, curve[k], k_min, k_max
+            );
+        }
+
+        KnnSelection { k, k_max, curve }
     }
 
     /// Build vertex connectivity using HNSW (Hierarchical Navigable Small World).
@@ -2931,6 +3320,234 @@ mod tests {
             assert!(result.fun < 1e-8, "{:?}: fun = {}", alg, result.fun);
             assert!(result.nlfev > 4 * result.xl.len(), "{:?}: only {} local evals", alg, result.nlfev);
         }
+    }
+
+    /// The |M_k| curve must be self-consistent: the graph actually built at
+    /// the selected k must have exactly `curve[k]` minimizer candidates. The
+    /// curve is also monotone non-increasing, and k is the smallest value
+    /// meeting the budget.
+    #[test]
+    fn test_knn_auto_curve_is_consistent_and_monotone() {
+        let multiwell = |x: &[f64]| -> f64 {
+            x.iter()
+                .enumerate()
+                .map(|(i, &v)| (v * v - 1.0).powi(2) + 0.1 * (1.0 + 0.05 * i as f64) * v)
+                .sum()
+        };
+        for budget in [10usize, 40, 200] {
+            let result = Shgo::new(multiwell, vec![(-2.0, 2.0); 5])
+                .with_options(ShgoOptions {
+                    sampling_method: SamplingMethod::Sobol,
+                    connectivity_method: ConnectivityMethod::KNearestNeighbors,
+                    n: 1024,
+                    iters: Some(1),
+                    minimize_every_iter: false,
+                    knn_auto: Some(KnnAuto::with_budget(budget)),
+                    ..Default::default()
+                })
+                .minimize()
+                .unwrap();
+            let sel = result.knn_selection.expect("auto selection was requested");
+            assert_eq!(sel.curve.len(), sel.k_max + 1);
+            for w in sel.curve.windows(2) {
+                assert!(w[1] <= w[0], "|M_k| must be non-increasing: {:?}", w);
+            }
+            // With minimize_every_iter = false every graph minimizer becomes an
+            // xl row, so the realized pool size must match the predicted one.
+            assert_eq!(
+                result.xl.len(),
+                sel.curve[sel.k],
+                "budget {}: curve predicted {} candidates at k={}, graph produced {}",
+                budget,
+                sel.curve[sel.k],
+                sel.k,
+                result.xl.len()
+            );
+            // k is the smallest value in range that meets the budget.
+            if sel.curve[sel.k] <= budget {
+                for k in (6..sel.k).rev() {
+                    assert!(
+                        sel.curve[k] > budget,
+                        "k={} already met budget {} ({} candidates) but k={} was chosen",
+                        k,
+                        budget,
+                        sel.curve[k],
+                        sel.k
+                    );
+                }
+            }
+        }
+    }
+
+    /// A tighter budget must not select a smaller k, and the pool it produces
+    /// must respect the budget whenever the curve can reach it.
+    #[test]
+    fn test_knn_auto_budget_controls_pool_size() {
+        let rastrigin_5d = |x: &[f64]| -> f64 {
+            let n = x.len() as f64;
+            10.0 * n
+                + x.iter()
+                    .map(|&xi| xi * xi - 10.0 * (2.0 * std::f64::consts::PI * xi).cos())
+                    .sum::<f64>()
+        };
+        let run = |budget: usize| {
+            Shgo::new(rastrigin_5d, vec![(-5.12, 5.12); 5])
+                .with_options(ShgoOptions {
+                    sampling_method: SamplingMethod::Sobol,
+                    connectivity_method: ConnectivityMethod::KNearestNeighbors,
+                    n: 2048,
+                    iters: Some(1),
+                    minimize_every_iter: false,
+                    knn_auto: Some(KnnAuto::with_budget(budget)),
+                    ..Default::default()
+                })
+                .minimize()
+                .unwrap()
+        };
+        let loose = run(400);
+        let tight = run(50);
+        let (kl, kt) = (
+            loose.knn_selection.as_ref().unwrap().k,
+            tight.knn_selection.as_ref().unwrap().k,
+        );
+        assert!(kt >= kl, "tighter budget selected smaller k ({} < {})", kt, kl);
+        assert!(tight.xl.len() <= 50, "tight budget gave {} candidates", tight.xl.len());
+        assert!(loose.xl.len() <= 400, "loose budget gave {} candidates", loose.xl.len());
+    }
+
+    #[test]
+    fn test_knn_auto_rejected_for_other_connectivity() {
+        let result = Shgo::new(sphere, vec![(-5.0, 5.0); 2])
+            .with_options(ShgoOptions {
+                sampling_method: SamplingMethod::Sobol,
+                connectivity_method: ConnectivityMethod::Delaunay,
+                n: 64,
+                iters: Some(1),
+                knn_auto: Some(KnnAuto::with_budget(10)),
+                ..Default::default()
+            })
+            .minimize();
+        assert!(matches!(result, Err(ShgoError::InvalidOption(_))));
+    }
+
+    /// Persistence pruning must cut local runs while keeping the global
+    /// minimum, and must never keep more candidates than the cap.
+    #[test]
+    fn test_persistence_pruning_cuts_candidates_and_keeps_global() {
+        let multiwell = |x: &[f64]| -> f64 {
+            x.iter()
+                .enumerate()
+                .map(|(i, &v)| (v * v - 1.0).powi(2) + 0.1 * (1.0 + 0.05 * i as f64) * v)
+                .sum()
+        };
+        let base = ShgoOptions {
+            sampling_method: SamplingMethod::Sobol,
+            connectivity_method: ConnectivityMethod::KNearestNeighbors,
+            n: 2048,
+            knn_neighbors: Some(11),
+            iters: Some(1),
+            ..Default::default()
+        };
+        let plain = Shgo::new(multiwell, vec![(-2.0, 2.0); 5])
+            .with_options(base.clone())
+            .minimize()
+            .unwrap();
+        let pruned = Shgo::new(multiwell, vec![(-2.0, 2.0); 5])
+            .with_options(ShgoOptions {
+                min_candidate_persistence: Some(0.05),
+                max_candidates_by_persistence: Some(20),
+                ..base
+            })
+            .minimize()
+            .unwrap();
+
+        assert!(pruned.xl.len() <= 20, "cap not honoured: {} rows", pruned.xl.len());
+        assert!(
+            pruned.nlfev < plain.nlfev,
+            "pruning did not reduce local evaluations ({} -> {})",
+            plain.nlfev,
+            pruned.nlfev
+        );
+        // NOTE: the global optimum is deliberately NOT asserted here.
+        // Persistence describes the SAMPLED landscape, and on a coarsely
+        // sampled multi-well function the basin that polishes deepest need not
+        // be a prominent one, so pruning can drop it. What is guaranteed is
+        // that the pool stays non-empty and keeps its lowest-cost candidate
+        // (see test_persistence_pruning_keeps_lowest_cost_candidate).
+        assert!(
+            pruned.funl.iter().any(|f| f.is_finite()),
+            "pruning removed every candidate"
+        );
+    }
+
+    /// The lowest-cost candidate survives even an aggressive persistence cap.
+    #[test]
+    fn test_persistence_pruning_keeps_lowest_cost_candidate() {
+        let multiwell = |x: &[f64]| -> f64 {
+            x.iter()
+                .enumerate()
+                .map(|(i, &v)| (v * v - 1.0).powi(2) + 0.1 * (1.0 + 0.05 * i as f64) * v)
+                .sum()
+        };
+        let base = ShgoOptions {
+            sampling_method: SamplingMethod::Sobol,
+            connectivity_method: ConnectivityMethod::KNearestNeighbors,
+            n: 2048,
+            knn_neighbors: Some(11),
+            iters: Some(1),
+            compute_basin_stats: true,
+            ..Default::default()
+        };
+        let plain = Shgo::new(multiwell, vec![(-2.0, 2.0); 5])
+            .with_options(base.clone())
+            .minimize()
+            .unwrap();
+        // Basins are sorted ascending by sampled cost, so the first one is the
+        // start that the guardrail must keep.
+        let lowest = plain
+            .basins
+            .as_ref()
+            .unwrap()
+            .first()
+            .and_then(|b| b.x_polished.clone())
+            .expect("lowest basin was polished");
+        let lowest_f = multiwell(&lowest);
+
+        let pruned = Shgo::new(multiwell, vec![(-2.0, 2.0); 5])
+            .with_options(ShgoOptions {
+                min_candidate_persistence: Some(1e9),
+                max_candidates_by_persistence: Some(1),
+                ..base
+            })
+            .minimize()
+            .unwrap();
+        assert_eq!(pruned.xl.len(), 1, "expected exactly the guarded candidate");
+        assert!(
+            (pruned.funl[0] - lowest_f).abs() < 1e-6,
+            "guarded candidate was not the lowest-cost one: {} vs {}",
+            pruned.funl[0],
+            lowest_f
+        );
+    }
+
+    /// The escape hatch that restores the pre-fix behaviour must actually
+    /// re-run the local optimizer from known minima.
+    #[test]
+    fn test_explore_from_known_minima_reruns_local_search() {
+        let bowl = |x: &[f64]| (x[0] - 0.3).powi(2);
+        let run = |explore: bool| {
+            Shgo::new(bowl, vec![(-1.0, 1.0)])
+                .with_options(ShgoOptions {
+                    sampling_method: SamplingMethod::Sobol,
+                    n: 8,
+                    maxiter: Some(3),
+                    explore_from_known_minima: explore,
+                    ..Default::default()
+                })
+                .minimize()
+                .unwrap()
+        };
+        assert!(run(true).nlfev > run(false).nlfev);
     }
 
     #[test]

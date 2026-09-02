@@ -165,11 +165,70 @@ for (i, (x, f)) in result.xl.iter().zip(result.funl.iter()).enumerate() {
 | `workers` | `Option<usize>` | `None` | Thread count (`None` = all cores) |
 | `xl_dedup_rtol` | `f64` | `1e-4` | Two local results are the same minimum when every coordinate agrees to this fraction of the bounds width (also stops re-minimizing sampling points that sit on a known minimum); `0` = bitwise only |
 | `xl_dedup_ftol` | `f64` | `1e-6` | Relative function-value agreement additionally required for merging |
+| `knn_auto` | `Option<KnnAuto>` | `None` | Pick k from the candidate-count curve to fit a local-run budget (k-NN connectivity only) |
+| `min_candidate_persistence` | `Option<f64>` | `None` | Drop candidates whose basin persistence is at or below this, before any local run |
+| `max_candidates_by_persistence` | `Option<usize>` | `None` | Keep at most this many candidates, most persistent first |
+| `explore_from_known_minima` | `bool` | `false` | Also re-run the local optimizer from already-found minima (see below) |
 | `f_min` + `f_tol` | — | — | Precision-based early stopping |
 
 `iters: None` is only accepted together with another stopping criterion
 (`maxiter`, `maxfev`, `maxev`, `maxtime` or `f_min`); otherwise `minimize()`
 returns `ShgoError::InvalidOption` instead of looping forever.
+
+### Choosing the k-NN neighbour count
+
+In Sobol + k-NN mode the sampling graph is a k-nearest-neighbour graph, so `k`
+trades superfluous local runs (small k, many spurious candidates) against
+missed minima (large k). The number of candidates `|M_k|` is non-increasing in
+k, and each candidate costs one local minimization, which makes k a dial on the
+local-search budget. `knn_auto` turns that dial for you from a single neighbour
+pass and **zero extra objective evaluations**:
+
+```rust
+use shgo::{KnnAuto, ShgoOptions, SamplingMethod, ConnectivityMethod};
+
+let options = ShgoOptions {
+    sampling_method: SamplingMethod::Sobol,
+    connectivity_method: ConnectivityMethod::KNearestNeighbors,
+    n: 16384,
+    knn_auto: Some(KnnAuto::with_budget(60)),  // at most ~60 local runs/iteration
+    ..Default::default()
+};
+// result.knn_selection holds the chosen k and the whole |M_k| curve.
+```
+
+If the curve cannot reach the budget within `k_max`, the largest k is used and
+the pool is simply as small as that k allows. Without `knn_auto`, `k` comes
+from `knn_neighbors` (default `2·dim + 1`, which is only safe up to roughly
+n = 1024 — measured floors for a unimodal surface at n = 16384 are k ≈ 16, 24,
+40 and 60 at dim 4, 6, 8 and 10).
+
+### Pruning the candidate pool by basin persistence
+
+`min_candidate_persistence` and `max_candidates_by_persistence` drop candidates
+whose basin merges into a deeper one at a low saddle — sampling artefacts
+rather than distinct basins — before any local run happens. Both cost `O(V·k)`
+arithmetic and no objective evaluations, and neither ever prunes the
+lowest-cost candidate.
+
+Persistence describes the **sampled** landscape, so when sampling is coarse
+relative to the number of minima the basin that polishes deepest need not be a
+prominent one. On a 2^d-well test function with 16384 points in 8 dimensions it
+ranked 231st of 246 basins by persistence. Treat these as breadth-of-map knobs,
+keep any threshold near the objective's noise floor, and do not rely on them to
+preserve the global optimum.
+
+### `explore_from_known_minima`
+
+Every minimum re-inserted into the next Sobol iteration is a graph minimizer,
+so re-running the local optimizer from it is possible (and is what this crate
+did before September 2026). With BOBYQA's large initial trust region such a run
+occasionally escapes to a deeper neighbouring basin, which made it an
+accidental restart heuristic. Measured, it is not worth the default: on a
+well-separated multi-well function it found **exactly** the same minima for
+29-67 % more local evaluations, and on Rastrigin it found more minima roughly
+in proportion to the extra cost. The global optimum was found either way in
+every case. The option exists to reproduce the old behaviour.
 
 ### Sampling Methods
 
