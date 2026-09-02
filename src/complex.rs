@@ -914,6 +914,29 @@ mod tests {
         assert!(!pool.is_empty() || complex.vertex_count() < 5);
     }
 
+    /// Regression: with a hash-ordered neighbor set the sub-region queue (and
+    /// therefore the vertices added by a budgeted refinement) changed from run
+    /// to run. Two complexes refined the same way must be identical.
+    #[test]
+    fn test_budgeted_refinement_is_deterministic() {
+        let build = || {
+            let bounds = vec![(0.0, 1.0), (0.0, 1.0), (0.0, 1.0)];
+            let mut c: Complex<_, fn(&[f64]) -> bool> = Complex::new(bounds, sphere, None);
+            for _ in 0..4 {
+                c.refine(Some(9));
+            }
+            let verts: Vec<Arc<crate::Vertex>> = c.cache.iter().collect();
+            verts
+                .iter()
+                .map(|v| (v.x().to_vec(), v.neighbor_indices()))
+                .collect::<Vec<_>>()
+        };
+        let a = build();
+        let b = build();
+        assert_eq!(a.len(), b.len());
+        assert_eq!(a, b, "refinement produced a different complex on a second run");
+    }
+
     #[test]
     fn test_generation_tracking() {
         let bounds = vec![(0.0, 1.0), (0.0, 1.0)];

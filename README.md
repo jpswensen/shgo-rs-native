@@ -20,12 +20,17 @@ among them. Key properties:
 - **Two sampling modes** — *Simplicial* (default, topology-aware) and *Sobol*
   (quasi-random, higher dimensional).
 
-This crate is a faithful port of the SciPy SHGO implementation, with all
-deviations and extensions documented (see `shgo_fable_recommendations.md`).
-Python cross-validation fixtures cover Sobol sequences, Delaunay
-triangulation, vertex caching, the simplicial complex, minimizer pool
-construction, and final result values — all verified to match SciPy output
-bit-for-bit where floating-point arithmetic allows.
+This crate is a port of the SciPy SHGO implementation with its deviations and
+extensions documented (see `shgo_fable_recommendations.md`). Python
+cross-validation fixtures pin what actually matches SciPy: Sobol sequence
+values (bit-exact), the initial simplicial triangulation (vertices and edges),
+vertex caching and minimizer detection, and end-to-end optimum values for
+single-iteration runs. Not identical to SciPy by design: the local optimizer
+(BOBYQA instead of SLSQP), Sobol-sequence continuation across iterations
+(SciPy's own is buggy), the Delaunay edge set (SciPy's `vf_to_vv` drops most
+simplex edges for `dim >= 3`; the faithful reproduction is available as
+`ConnectivityMethod::DelaunayScipyCompat`), the de-duplication of `xl`, and the
+simplicial refinement order beyond the first iteration.
 
 ## Usage
 
@@ -156,9 +161,109 @@ for (i, (x, f)) in result.xl.iter().zip(result.funl.iter()).enumerate() {
 | `minimize_every_iter` | `bool` | `true` | Run local minimization each iter |
 | `maxiter_local` | `Option<usize>` | `None` | Max local minimizations per iter |
 | `disp` | `usize` | `0` | Verbosity (0=silent, 1=summary, 2=detailed) |
-| `local_options` | `LocalOptimizerOptions` | BOBYQA, tol 1e-12 | Local solver algorithm + tolerances (`local_options.algorithm`) |
+| `local_options` | `LocalOptimizerOptions` | BOBYQA, tol 1e-12 | Local solver algorithm + tolerances (`local_options.algorithm`). Note `LocalOptimizerOptions::default()` on its own uses `ftol_rel = 1e-8`. |
 | `workers` | `Option<usize>` | `None` | Thread count (`None` = all cores) |
+| `xl_dedup_rtol` | `f64` | `1e-4` | Two local results are the same minimum when every coordinate agrees to this fraction of the bounds width (also stops re-minimizing sampling points that sit on a known minimum); `0` = bitwise only |
+| `xl_dedup_ftol` | `f64` | `1e-6` | Relative function-value agreement additionally required for merging |
+| `knn_auto` | `Option<KnnAuto>` | `None` | Pick k from the candidate-count curve to fit a local-run budget (k-NN connectivity only) |
+| `min_candidate_persistence` | `Option<f64>` | `None` | Drop candidates whose basin persistence is at or below this, before any local run |
+| `max_candidates_by_persistence` | `Option<usize>` | `None` | Keep at most this many candidates, most persistent first |
+| `explore_from_known_minima` | `bool` | `false` | Also re-run the local optimizer from already-found minima (see below) |
+| `robustness_probe` | `Option<RobustnessProbe>` | `None` | After optimization, measure each retained minimum's sensitivity to parameter perturbations on a deterministic stencil |
+| `robust_polish` | `Option<RobustPolish>` | `None` | Re-optimize the best minima on the stencil-smoothed objective; results in `robust_minima` |
 | `f_min` + `f_tol` | — | — | Precision-based early stopping |
+
+`iters: None` is only accepted together with another stopping criterion
+(`maxiter`, `maxfev`, `maxev`, `maxtime` or `f_min`); otherwise `minimize()`
+returns `ShgoError::InvalidOption` instead of looping forever.
+
+### Choosing the k-NN neighbour count
+
+In Sobol + k-NN mode the sampling graph is a k-nearest-neighbour graph, so `k`
+trades superfluous local runs (small k, many spurious candidates) against
+missed minima (large k). The number of candidates `|M_k|` is non-increasing in
+k, and each candidate costs one local minimization, which makes k a dial on the
+local-search budget. `knn_auto` turns that dial for you from a single neighbour
+pass and **zero extra objective evaluations**:
+
+```rust
+use shgo::{KnnAuto, ShgoOptions, SamplingMethod, ConnectivityMethod};
+
+let options = ShgoOptions {
+    sampling_method: SamplingMethod::Sobol,
+    connectivity_method: ConnectivityMethod::KNearestNeighbors,
+    n: 16384,
+    knn_auto: Some(KnnAuto::with_budget(60)),  // at most ~60 local runs/iteration
+    ..Default::default()
+};
+// result.knn_selection holds the chosen k and the whole |M_k| curve.
+```
+
+If the curve cannot reach the budget within `k_max`, the largest k is used and
+the pool is simply as small as that k allows. Without `knn_auto`, `k` comes
+from `knn_neighbors` (default `2·dim + 1`, which is only safe up to roughly
+n = 1024 — measured floors for a unimodal surface at n = 16384 are k ≈ 16, 24,
+40 and 60 at dim 4, 6, 8 and 10).
+
+### Pruning the candidate pool by basin persistence
+
+`min_candidate_persistence` and `max_candidates_by_persistence` drop candidates
+whose basin merges into a deeper one at a low saddle — sampling artefacts
+rather than distinct basins — before any local run happens. Both cost `O(V·k)`
+arithmetic and no objective evaluations, and neither ever prunes the
+lowest-cost candidate.
+
+Persistence describes the **sampled** landscape, so when sampling is coarse
+relative to the number of minima the basin that polishes deepest need not be a
+prominent one. On a 2^d-well test function with 16384 points in 8 dimensions it
+ranked 231st of 246 basins by persistence. Treat these as breadth-of-map knobs,
+keep any threshold near the objective's noise floor, and do not rely on them to
+preserve the global optimum.
+
+### Robustness to parameter perturbations
+
+Two opt-in post-optimization steps for problems whose answer must survive
+small parameter changes. Both use the same deterministic stencil around a
+point — the `2·dim` axis steps at a relative radius plus a small Sobol cloud in
+that box, clipped to the bounds, with constraint-violating points skipped —
+and both add their evaluations to `nfev` while leaving `x`, `fun`, `xl` and
+`funl` untouched.
+
+```rust
+use shgo::{RobustnessProbe, RobustPolish, ShgoOptions};
+
+let options = ShgoOptions {
+    // 3 % of each parameter's range, 8 Sobol points besides the axis steps
+    robustness_probe: Some(RobustnessProbe::new(0.03, 8)),
+    // re-optimize the 3 most robust minima on the stencil-averaged objective
+    robust_polish: Some(RobustPolish::new(0.03, 8, 3)),
+    ..Default::default()
+};
+// result.robustness[i]: f_center, robust_value (mean by default; Max and CVaR
+//   available), f_mean, f_max, f_std, worst_axis, n_feasible ...
+// result.robust_minima: x, robust_value, f_center per polished minimum
+```
+
+The probe is a **polished-point** measurement. The basin statistics
+(`compute_basin_stats`) describe the sampled cloud's catchments instead, and at
+realistic densities a basin's members are few and mostly far from its minimum:
+on a four-basin test at 8 192 points in 4 dimensions every basin's `f_median`
+was within 4e-4 of zero, while the probe ranked the basins by their actual
+widths and named the fragile axis. Use the cloud statistics for "how much of
+the space drains here", and the probe for "what happens if these parameters
+wobble".
+
+### `explore_from_known_minima`
+
+Every minimum re-inserted into the next Sobol iteration is a graph minimizer,
+so re-running the local optimizer from it is possible (and is what this crate
+did before September 2026). With BOBYQA's large initial trust region such a run
+occasionally escapes to a deeper neighbouring basin, which made it an
+accidental restart heuristic. Measured, it is not worth the default: on a
+well-separated multi-well function it found **exactly** the same minima for
+29-67 % more local evaluations, and on Rastrigin it found more minima roughly
+in proportion to the extra cost. The global optimum was found either way in
+every case. The option exists to reproduce the old behaviour.
 
 ### Sampling Methods
 
@@ -174,9 +279,10 @@ The sampling graph used for topological minimizer detection is configurable via
 
 | Variant | Description |
 |---|---|
-| `ConnectivityMethod::Delaunay` | QHull Delaunay triangulation (default, matches SciPy). Cost grows combinatorially with dimension — impractical above ~7 dims. |
+| `ConnectivityMethod::Delaunay` | QHull Delaunay triangulation, full 1-skeleton (default; every simplex edge, as in the SHGO paper). Cost grows combinatorially with dimension — impractical above ~7 dims. |
+| `ConnectivityMethod::DelaunayScipyCompat` | Delaunay with SciPy's `vf_to_vv` quirk reproduced (for `dim >= 3` only the first three vertices of each simplex are connected, which yields hundreds of spurious minimizer candidates). Parity testing only. |
 | `ConnectivityMethod::KNearestNeighbors` | Exact brute-force k-NN (rayon-parallel, O(n²·d)). Recommended for dim ≳ 7. |
-| `ConnectivityMethod::HNSW` | Approximate k-NN via `hnsw_rs`. Only pays off for very large point sets. |
+| `ConnectivityMethod::HNSW` | Approximate k-NN via `hnsw_rs` (the query point itself is excluded, so `k` means the same as for exact k-NN). Only pays off for very large point sets. |
 | `ConnectivityMethod::ScaNN` | Quantized approximate k-NN via `vecstore` (experimental; falls back to exact k-NN on failure). |
 
 All methods build the graph over the full cumulative point cloud each iteration,
@@ -188,8 +294,8 @@ matching SciPy's re-triangulation semantics.
 |---|---|---|
 | `LocalOptimizer::Bobyqa` | `LN_BOBYQA` | Default. Derivative-free, supports bounds. |
 | `LocalOptimizer::Cobyla` | `LN_COBYLA` | Supports nonlinear inequality constraints. |
-| `LocalOptimizer::Slsqp` | `LD_SLSQP` | Gradient-based, sequential least squares. |
-| `LocalOptimizer::Lbfgs` | `LD_LBFGS` | Limited-memory BFGS, gradient-based. |
+| `LocalOptimizer::Slsqp` | `LD_SLSQP` | Gradient-based, sequential least squares; supports inequality constraints. Gradients by forward finite differences, evaluated in parallel (rayon) and counted in `nfev`. |
+| `LocalOptimizer::Lbfgs` | `LD_LBFGS` | Limited-memory BFGS, gradient-based (finite-difference gradients as above). |
 | `LocalOptimizer::NelderMead` | `LN_NELDERMEAD` | Simplex method, no bounds. |
 | `LocalOptimizer::Praxis` | `LN_PRAXIS` | Principal axis method. |
 | `LocalOptimizer::NewuoaBound` | `LN_NEWUOA_BOUND` | NEWUOA with bound constraints. |
@@ -228,6 +334,24 @@ Function evaluations during **local minimization** are parallelized using
 | < 10 µs | `workers: Some(1)` — rayon overhead dominates |
 | 0.1–10 ms | `workers: None` — scales well with core count |
 | > 10 ms | `workers: None` — near-linear speedup |
+
+### Choosing the local optimizer for parallelism
+
+The candidate pool is parallelised across candidates, and each candidate's
+local minimization is a serial chain. A gradient-based method (`Slsqp`,
+`Lbfgs`) additionally fans its `dim` finite differences across threads, so
+which algorithm is fastest depends on how the pool compares with the core
+count. Measured on 16 cores:
+
+| regime | fastest | note |
+|---|---|---|
+| 25 candidates, 15 dims, 1.4 ms objective | BOBYQA (4.8 s vs 8.2 s for `Lbfgs`) | the pool already saturates the threads; the gradient's inner parallelism only adds scheduling |
+| 1 candidate, 12 dims, 0.4 ms objective | `Slsqp` (0.019 s vs 0.037 s) | half the wall clock on 18 % *more* evaluations, because the gradient is 12-wide |
+| evaluations are the scarce resource | `Lbfgs` | 2.5x fewer objective evaluations than BOBYQA in the 15-dimensional case |
+
+BOBYQA remains the default. Consider a gradient method when the candidate pool
+is narrower than the core count, which is the usual state of later iterations
+and of a small `maxiter_local`.
 
 ## SciPy Correspondence
 
@@ -315,16 +439,20 @@ cross-validation suite:
 
 - **Sobol sequences** — direction numbers and sequence values match SciPy
   `scipy.stats.qmc.Sobol` exactly.
-- **Triangulation** — Delaunay simplices, sorted and compared against
-  `scipy.spatial.Delaunay`.
-- **Vertex operations** — sorting, normalization, and connectivity match the
-  Python `Vertex` / `VertexCache` classes.
-- **Simplicial complex** — complex construction, refinement, and minimizer
-  pool topology match SciPy.
+- **Vertex operations** — midpoints, field evaluation, and minimizer detection
+  match the Python `Vertex` / `VertexCache` classes.
+- **Simplicial complex** — the initial triangulation (vertex count and 2-D
+  connectivity) matches SciPy; per-iteration growth matches SciPy's `+n`
+  semantics. Refinement order beyond the first iteration is deterministic but
+  not identical to SciPy's.
 - **Minimizer results** — end-to-end fixtures (`tests/generate_e2e_fixtures.py`)
   record `scipy.optimize.shgo` results for sphere/Rosenbrock/constrained cases
   across both sampling modes; `test_end_to_end_matches_scipy` replays them in
-  Rust and asserts agreement.
+  Rust and asserts agreement of the optimum.
+- **Regression tests** for the behaviours fixed in September 2026: deterministic
+  refinement, no re-minimization of known minima, full-skeleton Delaunay
+  connectivity, working finite-difference gradients for SLSQP/L-BFGS, and
+  constraints honoured by the public local-minimization API.
 
 Run the full test suite:
 
