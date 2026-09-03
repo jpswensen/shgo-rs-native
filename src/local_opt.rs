@@ -40,6 +40,21 @@
 //!   and reflecting out-of-box points back inside (see [`CmaesOptions`]).
 //!   Every run is seeded from the starting point, so results are deterministic.
 //!
+//! # Constraints
+//!
+//! Inequality constraints come in two forms: closures in SHGO's `g(x) >= 0`
+//! convention and explicit [`LinearConstraint`]s (`a · x >= b`). COBYLA and
+//! SLSQP take both natively. For every other algorithm
+//! [`LocalOptimizerOptions::constraint_handling`] decides what happens:
+//! [`ConstraintHandling::UpgradeToCobyla`] (default, SciPy-like) switches the
+//! run to COBYLA, [`ConstraintHandling::KeepAlgorithm`] wraps NLopt methods in
+//! NLopt's augmented Lagrangian (AUGLAG) so BOBYQA or Subplex keep their
+//! identity. CMA-ES handles linear constraints itself by mirroring every
+//! sample across a violated constraint, as it does at the bounds (exact, so
+//! it is used under both settings), and, under `KeepAlgorithm`, nonlinear closures by a
+//! feasibility-first penalty that never evaluates the objective at an
+//! infeasible point.
+//!
 //! # Example
 //!
 //! ```
@@ -149,9 +164,102 @@ impl LocalOptimizer {
         matches!(self, LocalOptimizer::Cobyla | LocalOptimizer::Slsqp)
     }
 
+    /// Check if the algorithm supports [`LinearConstraint`]s natively
+    /// (COBYLA and SLSQP as generic constraints, CMA-ES by mirroring).
+    pub fn supports_linear_constraints(self) -> bool {
+        matches!(
+            self,
+            LocalOptimizer::Cobyla | LocalOptimizer::Slsqp | LocalOptimizer::Cmaes
+        )
+    }
+
+    /// Whether the algorithm can run a problem with these constraint kinds
+    /// without upgrading or wrapping.
+    pub fn handles_natively(self, has_nonlinear: bool, has_linear: bool) -> bool {
+        (!has_nonlinear || self.supports_constraints())
+            && (!has_linear || self.supports_linear_constraints())
+    }
+
     /// Check if the algorithm requires gradients (supplied by finite differences).
     pub fn requires_gradient(self) -> bool {
         matches!(self, LocalOptimizer::Slsqp | LocalOptimizer::Lbfgs)
+    }
+}
+
+/// What to do with constraints when the chosen algorithm has no native
+/// support for them (everything except COBYLA and SLSQP; CMA-ES supports
+/// linear constraints natively by projection).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum ConstraintHandling {
+    /// Switch the run to COBYLA, as SciPy's SHGO effectively does. Default.
+    #[default]
+    UpgradeToCobyla,
+
+    /// Keep the chosen algorithm. NLopt methods are wrapped in NLopt's
+    /// augmented Lagrangian (`AUGLAG`), which folds the constraints into an
+    /// adaptive penalty and re-runs the inner method until the multipliers
+    /// converge; the result satisfies the constraints to `constraint_tol`.
+    /// CMA-ES mirrors samples across linear constraints and treats nonlinear
+    /// closures with a feasibility-first penalty: an infeasible sample is not
+    /// evaluated and ranks below the start point by its total violation.
+    KeepAlgorithm,
+}
+
+/// Linear inequality constraint `a · x >= b` (SHGO's `g(x) >= 0` convention
+/// with `g(x) = a · x - b`).
+///
+/// Declaring a constraint as linear rather than as a closure lets CMA-ES
+/// keep every sample feasible by mirroring it across the constraint (the
+/// same fold it applies at the bounds) instead of falling back to COBYLA,
+/// and lets SHGO's sampling filter it without calling user code.
+#[derive(Debug, Clone, PartialEq)]
+pub struct LinearConstraint {
+    /// Coefficient vector `a` (one entry per dimension).
+    pub a: Vec<f64>,
+    /// Right-hand side `b`.
+    pub b: f64,
+}
+
+impl LinearConstraint {
+    /// `a · x >= b`.
+    pub fn ge(a: Vec<f64>, b: f64) -> Self {
+        Self { a, b }
+    }
+
+    /// `a · x <= b`, stored as `-a · x >= -b`.
+    pub fn le(a: Vec<f64>, b: f64) -> Self {
+        Self {
+            a: a.into_iter().map(|v| -v).collect(),
+            b: -b,
+        }
+    }
+
+    /// `g(x) = a · x - b`; feasible when `>= 0`.
+    pub fn value(&self, x: &[f64]) -> f64 {
+        self.a.iter().zip(x).map(|(ai, xi)| ai * xi).sum::<f64>() - self.b
+    }
+
+    /// Whether `x` satisfies the constraint to within `tol`.
+    pub fn is_satisfied(&self, x: &[f64], tol: f64) -> bool {
+        self.value(x) >= -tol
+    }
+}
+
+/// Which algorithm actually runs for a problem with the given kinds of
+/// constraints, after applying `options.constraint_handling`. Exposed so
+/// callers (SHGO) can warn when the choice differs from `options.algorithm`.
+pub fn effective_algorithm(
+    options: &LocalOptimizerOptions,
+    has_nonlinear: bool,
+    has_linear: bool,
+) -> LocalOptimizer {
+    let algo = options.algorithm;
+    if algo.handles_natively(has_nonlinear, has_linear) {
+        return algo;
+    }
+    match options.constraint_handling {
+        ConstraintHandling::UpgradeToCobyla => LocalOptimizer::Cobyla,
+        ConstraintHandling::KeepAlgorithm => algo,
     }
 }
 
@@ -249,6 +357,10 @@ pub struct LocalOptimizerOptions {
 
     /// Settings used only when `algorithm == LocalOptimizer::Cmaes`.
     pub cmaes: CmaesOptions,
+
+    /// What to do with constraints the chosen algorithm cannot take natively.
+    /// Default: `UpgradeToCobyla`.
+    pub constraint_handling: ConstraintHandling,
 }
 
 impl Default for LocalOptimizerOptions {
@@ -265,6 +377,7 @@ impl Default for LocalOptimizerOptions {
             constraint_tol: 1e-8,
             disp: false,
             cmaes: CmaesOptions::default(),
+            constraint_handling: ConstraintHandling::UpgradeToCobyla,
         }
     }
 }
@@ -275,6 +388,9 @@ pub type BoxedConstraint = Box<dyn Fn(&[f64]) -> f64 + Send + Sync>;
 /// A scalar function reference usable from the NLOPT callbacks (and from the
 /// rayon workers that evaluate finite-difference gradients).
 type ScalarFn<'a> = &'a (dyn Fn(&[f64]) -> f64 + Sync);
+
+/// An owned scalar function (linear constraints turned into closures).
+type BoxedScalarFn = Box<dyn Fn(&[f64]) -> f64 + Sync>;
 
 /// Result of a local minimization.
 #[derive(Debug, Clone)]
@@ -337,18 +453,22 @@ fn fd_gradient(
     x.len()
 }
 
-/// Run one local minimization. Shared by the two public entry points.
+/// Run one local minimization. Shared by the public entry points.
 ///
-/// `constraints` are inequality constraints in SHGO's `g(x) >= 0` convention;
-/// if any are present and `options.algorithm` cannot handle them the run is
-/// upgraded to COBYLA. Gradient-based algorithms receive forward-difference
-/// gradients of the objective and of every constraint. `Cmaes` is dispatched
-/// to the `cmaes` crate; everything else runs through NLopt.
+/// `constraints` are inequality constraints in SHGO's `g(x) >= 0` convention
+/// and `linear` are explicit linear ones. If any are present and
+/// `options.algorithm` cannot take them natively, `options.constraint_handling`
+/// decides between upgrading to COBYLA and keeping the algorithm (AUGLAG for
+/// NLopt methods, projection/penalty for CMA-ES). Gradient-based algorithms
+/// receive forward-difference gradients of the objective and of every
+/// constraint. `Cmaes` is dispatched to the `cmaes` crate; everything else
+/// runs through NLopt.
 fn run_local(
     func: ScalarFn<'_>,
     x0: &[f64],
     bounds: &[(f64, f64)],
     constraints: &[ScalarFn<'_>],
+    linear: &[LinearConstraint],
     options: &LocalOptimizerOptions,
 ) -> LocalOptResult {
     let dim = x0.len();
@@ -364,21 +484,48 @@ fn run_local(
             ),
         );
     }
+    if let Some(bad) = linear.iter().find(|c| c.a.len() != dim) {
+        return LocalOptResult::failure(
+            x0,
+            format!(
+                "Dimension mismatch: linear constraint has {} coefficients but x0 has {}",
+                bad.a.len(),
+                dim
+            ),
+        );
+    }
 
-    // Constrained problems need a constraint-capable algorithm.
-    let algo = if !constraints.is_empty() && !options.algorithm.supports_constraints() {
-        LocalOptimizer::Cobyla
-    } else {
-        options.algorithm
-    };
+    let has_nonlinear = !constraints.is_empty();
+    let has_linear = !linear.is_empty();
+    let algo = effective_algorithm(options, has_nonlinear, has_linear);
 
     match algo.to_nlopt_algorithm() {
-        Some(nlopt_algo) => run_nlopt(func, x0, bounds, constraints, options, algo, nlopt_algo),
-        None => run_cmaes(func, x0, bounds, options),
+        Some(nlopt_algo) => {
+            // NLopt sees linear constraints as ordinary inequality closures.
+            let linear_fns: Vec<BoxedScalarFn> = linear
+                .iter()
+                .map(|c| {
+                    let c = c.clone();
+                    Box::new(move |x: &[f64]| c.value(x)) as BoxedScalarFn
+                })
+                .collect();
+            let all: Vec<ScalarFn<'_>> = constraints
+                .iter()
+                .copied()
+                .chain(linear_fns.iter().map(|b| &**b as ScalarFn<'_>))
+                .collect();
+            let use_auglag = !algo.handles_natively(has_nonlinear, has_linear);
+            run_nlopt(func, x0, bounds, &all, options, algo, nlopt_algo, use_auglag)
+        }
+        None => run_cmaes(func, x0, bounds, constraints, linear, options),
     }
 }
 
 /// Run one NLOPT local minimization with the already-resolved algorithm.
+/// With `use_auglag` the algorithm runs as the subsidiary optimizer of
+/// NLopt's augmented Lagrangian, which is how bound-only methods take the
+/// constraints.
+#[allow(clippy::too_many_arguments)]
 fn run_nlopt(
     func: ScalarFn<'_>,
     x0: &[f64],
@@ -387,9 +534,15 @@ fn run_nlopt(
     options: &LocalOptimizerOptions,
     algo: LocalOptimizer,
     nlopt_algo: Algorithm,
+    use_auglag: bool,
 ) -> LocalOptResult {
     let dim = x0.len();
     let needs_grad = algo.requires_gradient();
+    let label = if use_auglag {
+        format!("AUGLAG({:?})", algo)
+    } else {
+        format!("{:?}", algo)
+    };
 
     // Track function evaluations (finite-difference evaluations included).
     let fev_count = AtomicUsize::new(0);
@@ -401,7 +554,7 @@ fn run_nlopt(
         let n = fev_count.fetch_add(1, Ordering::Relaxed) + 1;
         let val = func(x);
         if disp {
-            println!("  [{:?} eval #{:>3}] f = {:+.6e}", algo, n, val);
+            println!("  [{} eval #{:>3}] f = {:+.6e}", label, n, val);
         }
         if let Some(g) = grad {
             if needs_grad {
@@ -412,8 +565,32 @@ fn run_nlopt(
         val
     };
 
-    // Create NLOPT optimizer
-    let mut opt = Nlopt::new(nlopt_algo, dim, objective, Target::Minimize, ());
+    // Create the NLOPT optimizer: either the algorithm itself, or AUGLAG with
+    // the algorithm as its subsidiary (NLopt copies the subsidiary's
+    // algorithm and stopping criteria; its bounds/objective are ignored).
+    let mut opt = if use_auglag {
+        let mut outer = Nlopt::new(Algorithm::Auglag, dim, objective, Target::Minimize, ());
+        let mut inner = outer.get_local_optimizer(nlopt_algo);
+        let _ = inner.set_ftol_rel(options.ftol_rel);
+        let _ = inner.set_ftol_abs(options.ftol_abs);
+        let _ = inner.set_xtol_rel(options.xtol_rel);
+        let _ = inner.set_xtol_abs1(options.xtol_abs);
+        if let Some(maxeval) = options.maxeval {
+            let _ = inner.set_maxeval(maxeval);
+        }
+        if let Some(step) = options.initial_step {
+            let _ = inner.set_initial_step1(step);
+        }
+        if outer.set_local_optimizer(inner).is_err() {
+            return LocalOptResult::failure(
+                x0,
+                format!("Failed to set {:?} as the AUGLAG subsidiary optimizer", algo),
+            );
+        }
+        outer
+    } else {
+        Nlopt::new(nlopt_algo, dim, objective, Target::Minimize, ())
+    };
 
     // Set bounds
     let lower_bounds: Vec<f64> = bounds.iter().map(|(l, _)| *l).collect();
@@ -478,12 +655,12 @@ fn run_nlopt(
     if disp {
         match &result {
             Ok((state, fval)) => println!(
-                "  [{:?}] {:?}: f_best = {:+.6e} ({} evals)",
-                algo, state, fval, final_fev
+                "  [{}] {:?}: f_best = {:+.6e} ({} evals)",
+                label, state, fval, final_fev
             ),
             Err((state, fval)) => println!(
-                "  [{:?}] FAILED {:?}: f_best = {:+.6e} ({} evals)",
-                algo, state, fval, final_fev
+                "  [{}] FAILED {:?}: f_best = {:+.6e} ({} evals)",
+                label, state, fval, final_fev
             ),
         }
     }
@@ -507,7 +684,7 @@ fn run_nlopt(
             x,
             fun: fval,
             success: true,
-            message: format!("Optimization succeeded: {:?}", success_state),
+            message: format!("Optimization succeeded: {:?} ({})", success_state, label),
             nfev: final_fev,
             nit: 0, // NLOPT doesn't track iterations for all algorithms
         },
@@ -614,17 +791,102 @@ impl BoxMap {
             .collect()
     }
 
-    /// Normalised search coordinates -> a point inside the box.
-    fn to_box(&self, z: &[f64]) -> Vec<f64> {
+    /// The box in normalised units (`±inf` where a bound is missing).
+    fn u_bounds(&self) -> Vec<(f64, f64)> {
+        (0..self.lo.len())
+            .map(|i| {
+                let o = self.origin(i);
+                let lo = if self.lo[i].is_finite() { (self.lo[i] - o) / self.scale[i] } else { f64::NEG_INFINITY };
+                let hi = if self.hi[i].is_finite() { (self.hi[i] - o) / self.scale[i] } else { f64::INFINITY };
+                (lo, hi)
+            })
+            .collect()
+    }
+
+    /// Fold unbounded search coordinates into the box (reflection), in
+    /// normalised units.
+    fn fold(&self, z: &[f64]) -> Vec<f64> {
+        let ub = self.u_bounds();
         z.iter()
+            .zip(&ub)
+            .map(|(&zi, &(lo, hi))| reflect_into(zi, lo, hi))
+            .collect()
+    }
+
+    /// Normalised (in-box) coordinates -> box coordinates.
+    fn unscale(&self, u: &[f64]) -> Vec<f64> {
+        u.iter()
             .enumerate()
-            .map(|(i, &zi)| reflect_into(self.origin(i) + zi * self.scale[i], self.lo[i], self.hi[i]))
+            .map(|(i, &ui)| self.origin(i) + ui * self.scale[i])
+            .collect()
+    }
+
+    /// Linear constraints `a · x >= b` rewritten in normalised units:
+    /// `(a ∘ scale) · u >= b - a · origin`.
+    fn half_spaces(&self, linear: &[LinearConstraint]) -> Vec<HalfSpace> {
+        linear
+            .iter()
+            .map(|c| {
+                let a: Vec<f64> = c.a.iter().zip(&self.scale).map(|(ai, si)| ai * si).collect();
+                let shift: f64 = c.a.iter().enumerate().map(|(i, ai)| ai * self.origin(i)).sum();
+                let aa = a.iter().map(|v| v * v).sum();
+                HalfSpace { a, b: c.b - shift, aa }
+            })
             .collect()
     }
 
     /// Smallest normalisation factor (for converting absolute x tolerances).
     fn min_scale(&self) -> f64 {
         self.scale.iter().cloned().fold(f64::INFINITY, f64::min).max(f64::MIN_POSITIVE)
+    }
+}
+
+/// Half-space `a · u >= b` in normalised coordinates (`aa = a · a`).
+struct HalfSpace {
+    a: Vec<f64>,
+    b: f64,
+    aa: f64,
+}
+
+/// Euclidean projection of `u` onto `box ∩ half-spaces` by Dykstra's
+/// alternating projections (exact in the limit; a handful of sweeps for a few
+/// constraints). Stops when a full sweep moves the point by less than `tol`
+/// in every coordinate, or after `max_sweeps` (an infeasible intersection
+/// never converges; the caller checks feasibility afterwards).
+fn project_onto_polytope(u: &mut [f64], ubox: &[(f64, f64)], half_spaces: &[HalfSpace], tol: f64, max_sweeps: usize) {
+    let n = u.len();
+    let sets = 1 + half_spaces.len();
+    let mut increments = vec![vec![0.0; n]; sets];
+    let mut y = vec![0.0; n];
+    for _ in 0..max_sweeps {
+        let mut moved: f64 = 0.0;
+        for k in 0..sets {
+            for i in 0..n {
+                y[i] = u[i] + increments[k][i];
+            }
+            if k == 0 {
+                for i in 0..n {
+                    let (lo, hi) = ubox[i];
+                    let p = y[i].max(lo).min(hi);
+                    increments[k][i] = y[i] - p;
+                    moved = moved.max((p - u[i]).abs());
+                    u[i] = p;
+                }
+            } else {
+                let h = &half_spaces[k - 1];
+                let v = h.a.iter().zip(y.iter()).map(|(a, b)| a * b).sum::<f64>() - h.b;
+                let step = if v < 0.0 && h.aa > 0.0 { -v / h.aa } else { 0.0 };
+                for i in 0..n {
+                    let p = y[i] + step * h.a[i];
+                    increments[k][i] = y[i] - p;
+                    moved = moved.max((p - u[i]).abs());
+                    u[i] = p;
+                }
+            }
+        }
+        if moved <= tol {
+            break;
+        }
     }
 }
 
@@ -652,10 +914,21 @@ fn cmaes_seed(base: u64, x0: &[f64]) -> u64 {
 /// the evaluation/time budget counts as success; numerical breakdowns
 /// (`InvalidFunctionValue`, `PosDefCov`, `TolXUp`) are reported as failures
 /// but still return the best point seen.
+///
+/// Constraints: every sample is mirrored across any `linear` constraint it
+/// violates (and folded into the box) before evaluation, so those hold
+/// exactly; Dykstra projection onto the polytope is the fallback where
+/// mirroring does not settle. Nonlinear `constraints` are handled by a feasibility-first
+/// penalty: an infeasible sample is not evaluated and receives a value above
+/// the start point's, increasing with its violation, so CMA-ES's ranking
+/// pushes the population back into the feasible region. The returned point
+/// is always feasible; if none was found the result is a failure.
 fn run_cmaes(
     func: ScalarFn<'_>,
     x0: &[f64],
     bounds: &[(f64, f64)],
+    constraints: &[ScalarFn<'_>],
+    linear: &[LinearConstraint],
     options: &LocalOptimizerOptions,
 ) -> LocalOptResult {
     let dim = x0.len();
@@ -671,6 +944,9 @@ fn run_cmaes(
     }
 
     let map = BoxMap::new(bounds);
+    let ubox = map.u_bounds();
+    let half_spaces = map.half_spaces(linear);
+    let ctol = options.constraint_tol.max(0.0);
     let disp = options.disp;
     let fev_count = AtomicUsize::new(0);
     // Evaluate through the box map; counts every evaluation.
@@ -682,11 +958,80 @@ fn run_cmaes(
         }
         val
     };
+    // Search coordinates -> feasible box point. Out-of-box coordinates are
+    // folded back (triangle wave) and a sample beyond a linear constraint is
+    // mirrored across it, so the landscape CMA-ES sees has no flat repaired
+    // region (projection would map everything outside onto the boundary and
+    // let the mean drift out, stalling the search on the boundary). A few
+    // alternating rounds settle interactions between constraints and the
+    // box; Dykstra projection is the fallback for a corner where mirroring
+    // keeps bouncing.
+    let to_feasible = |z: &[f64]| -> Vec<f64> {
+        let mut u = map.fold(z);
+        if !half_spaces.is_empty() {
+            let mut settled = false;
+            for _ in 0..16 {
+                let mut changed = false;
+                for h in &half_spaces {
+                    if h.aa == 0.0 {
+                        continue;
+                    }
+                    let v = h.a.iter().zip(&u).map(|(a, b)| a * b).sum::<f64>() - h.b;
+                    if v < 0.0 {
+                        let step = -2.0 * v / h.aa;
+                        for (ui, ai) in u.iter_mut().zip(&h.a) {
+                            *ui += step * ai;
+                        }
+                        changed = true;
+                    }
+                }
+                if !changed {
+                    settled = true;
+                    break;
+                }
+                u = map.fold(&u);
+            }
+            if !settled {
+                project_onto_polytope(&mut u, &ubox, &half_spaces, 1e-12, 500);
+            }
+        }
+        map.unscale(&u)
+    };
+    // Total constraint violation at a box point (0 when feasible). Linear
+    // constraints are included for the case of an infeasible polytope.
+    let violation = |x: &[f64]| -> f64 {
+        let mut v = 0.0;
+        for g in constraints {
+            let gv = g(x);
+            if gv.is_nan() {
+                v += 1.0;
+            } else if gv < -ctol {
+                v -= gv;
+            }
+        }
+        for c in linear {
+            let gv = c.value(x);
+            if gv < -ctol {
+                v -= gv;
+            }
+        }
+        v
+    };
 
-    // Incumbent: the starting point itself.
-    let x0_in_box = map.to_box(&map.to_internal(x0));
-    let mut best_x = x0_in_box;
-    let mut best_f = eval_box(&best_x);
+    // Incumbent: the starting point itself (projected onto the linear
+    // constraints if it violates them).
+    let mut best_x = to_feasible(&map.to_internal(x0));
+    let mut best_f = if violation(&best_x) == 0.0 {
+        eval_box(&best_x)
+    } else {
+        f64::INFINITY
+    };
+    // Infeasible samples rank above the start point by their violation.
+    let penalty_base = if best_f.is_finite() {
+        best_f + best_f.abs().max(1.0)
+    } else {
+        1.0
+    };
 
     let reserved = 1 + usize::from(cfg.eval_final_mean);
     let z0 = map.to_internal(&best_x);
@@ -714,7 +1059,14 @@ fn run_cmaes(
         }
     }
 
-    let objective = |z: &DVector<f64>| -> f64 { eval_box(&map.to_box(z.as_slice())) };
+    let objective = |z: &DVector<f64>| -> f64 {
+        let x = to_feasible(z.as_slice());
+        let v = violation(&x);
+        if v > 0.0 {
+            return penalty_base + v;
+        }
+        eval_box(&x)
+    };
     let mut state = match builder.build(&objective) {
         Ok(s) => s,
         Err(e) => {
@@ -735,20 +1087,25 @@ fn run_cmaes(
     };
     let generations = state.generation();
 
-    // Best evaluated point, then optionally the final mean.
+    // Best evaluated point, then optionally the final mean. Only feasible
+    // points can be returned (a penalised sample never beats the incumbent
+    // unless the start itself was infeasible, hence the explicit check).
     let better = |f: f64, incumbent: f64| f < incumbent || (incumbent.is_nan() && !f.is_nan());
     if let Some(ind) = data.overall_best.as_ref() {
-        if better(ind.value, best_f) {
-            best_x = map.to_box(ind.point.as_slice());
+        let x = to_feasible(ind.point.as_slice());
+        if violation(&x) == 0.0 && better(ind.value, best_f) {
+            best_x = x;
             best_f = ind.value;
         }
     }
     if cfg.eval_final_mean {
-        let xm = map.to_box(data.final_mean.as_slice());
-        let fm = eval_box(&xm);
-        if better(fm, best_f) {
-            best_x = xm;
-            best_f = fm;
+        let xm = to_feasible(data.final_mean.as_slice());
+        if violation(&xm) == 0.0 {
+            let fm = eval_box(&xm);
+            if better(fm, best_f) {
+                best_x = xm;
+                best_f = fm;
+            }
         }
     }
     let final_fev = fev_count.load(Ordering::Relaxed);
@@ -771,14 +1128,16 @@ fn run_cmaes(
     }
 
     if !best_f.is_finite() {
+        let why = if constraints.is_empty() && linear.is_empty() {
+            "objective is non-finite at the returned point"
+        } else {
+            "no feasible point with a finite objective was found"
+        };
         LocalOptResult {
             x: best_x,
             fun: best_f,
             success: false,
-            message: format!(
-                "Optimization failed: objective is non-finite at the returned point ({})",
-                reasons
-            ),
+            message: format!("Optimization failed: {} ({})", why, reasons),
             nfev: final_fev,
             nit: generations,
         }
@@ -842,13 +1201,15 @@ where
     let cons: Vec<ScalarFn<'_>> = constraints
         .map(|cs| cs.iter().map(|g| g as ScalarFn<'_>).collect())
         .unwrap_or_default();
-    run_local(func, x0, bounds, &cons, options)
+    run_local(func, x0, bounds, &cons, &[], options)
 }
 
-/// Perform local minimization with constraints using NLOPT's constraint support.
+/// Perform local minimization with constraints.
 ///
 /// This version adds inequality constraints to the optimizer for algorithms
-/// that support them (COBYLA, SLSQP); other algorithms are upgraded to COBYLA.
+/// that support them (COBYLA, SLSQP); other algorithms are upgraded to COBYLA
+/// or wrapped, per `options.constraint_handling`. See
+/// [`minimize_local_with_constraints`] to pass linear constraints as well.
 ///
 /// # Arguments
 ///
@@ -871,8 +1232,28 @@ pub fn minimize_local_constrained<F>(
 where
     F: Fn(&[f64]) -> f64 + Sync,
 {
+    minimize_local_with_constraints(func, x0, bounds, constraints, &[], options)
+}
+
+/// Perform local minimization with nonlinear (`g(x) >= 0` closures) and
+/// linear ([`LinearConstraint`]) inequality constraints.
+///
+/// COBYLA and SLSQP take both kinds natively; CMA-ES takes linear constraints
+/// natively by projecting every sample onto them. Any other combination is
+/// resolved by `options.constraint_handling` (see [`ConstraintHandling`]).
+pub fn minimize_local_with_constraints<F>(
+    func: F,
+    x0: &[f64],
+    bounds: &[(f64, f64)],
+    constraints: &[BoxedConstraint],
+    linear: &[LinearConstraint],
+    options: &LocalOptimizerOptions,
+) -> LocalOptResult
+where
+    F: Fn(&[f64]) -> f64 + Sync,
+{
     let cons: Vec<ScalarFn<'_>> = constraints.iter().map(|b| &**b as ScalarFn<'_>).collect();
-    run_local(&func, x0, bounds, &cons, options)
+    run_local(&func, x0, bounds, &cons, linear, options)
 }
 
 #[cfg(test)]
@@ -1230,7 +1611,7 @@ mod tests {
         assert_relative_eq!(z[0], 0.75);
         assert_relative_eq!(z[1], 0.25);
         assert_relative_eq!(z[2], -7.0);
-        let back = map.to_box(&z);
+        let back = map.unscale(&map.fold(&z));
         for (a, b) in back.iter().zip(&x) {
             assert_relative_eq!(a, b, epsilon = 1e-12);
         }
@@ -1423,5 +1804,192 @@ mod tests {
         assert!(!result.message.contains("CMA-ES"));
         assert!(result.x[0] + result.x[1] - 1.0 >= -1e-6);
         assert_relative_eq!(result.fun, 0.5, epsilon = 1e-4);
+    }
+    #[test]
+    fn test_linear_constraint_forms() {
+        let ge = LinearConstraint::ge(vec![1.0, 1.0], 1.0); // x0 + x1 >= 1
+        assert_relative_eq!(ge.value(&[0.75, 0.75]), 0.5);
+        assert!(ge.is_satisfied(&[0.5, 0.5], 0.0));
+        assert!(!ge.is_satisfied(&[0.2, 0.2], 1e-9));
+        let le = LinearConstraint::le(vec![1.0, 1.0], 1.0); // x0 + x1 <= 1
+        assert_eq!(le.a, vec![-1.0, -1.0]);
+        assert_eq!(le.b, -1.0);
+        assert!(le.is_satisfied(&[0.2, 0.2], 0.0));
+        assert!(!le.is_satisfied(&[0.75, 0.75], 0.0));
+    }
+
+    #[test]
+    fn test_effective_algorithm_rules() {
+        let with = |algorithm, constraint_handling| LocalOptimizerOptions {
+            algorithm,
+            constraint_handling,
+            ..Default::default()
+        };
+        use ConstraintHandling::{KeepAlgorithm, UpgradeToCobyla};
+        use LocalOptimizer::*;
+        // Nothing to handle: always the chosen algorithm.
+        assert_eq!(effective_algorithm(&with(Bobyqa, UpgradeToCobyla), false, false), Bobyqa);
+        // Native support is never overridden.
+        assert_eq!(effective_algorithm(&with(Slsqp, UpgradeToCobyla), true, true), Slsqp);
+        assert_eq!(effective_algorithm(&with(Cobyla, KeepAlgorithm), true, true), Cobyla);
+        // Bound-only NLopt methods: upgrade by default, keep on request.
+        assert_eq!(effective_algorithm(&with(Bobyqa, UpgradeToCobyla), true, false), Cobyla);
+        assert_eq!(effective_algorithm(&with(Bobyqa, UpgradeToCobyla), false, true), Cobyla);
+        assert_eq!(effective_algorithm(&with(Sbplx, KeepAlgorithm), true, false), Sbplx);
+        // CMA-ES: linear constraints are native, nonlinear ones follow the setting.
+        assert_eq!(effective_algorithm(&with(Cmaes, UpgradeToCobyla), false, true), Cmaes);
+        assert_eq!(effective_algorithm(&with(Cmaes, UpgradeToCobyla), true, false), Cobyla);
+        assert_eq!(effective_algorithm(&with(Cmaes, KeepAlgorithm), true, true), Cmaes);
+    }
+
+    #[test]
+    fn test_polytope_projection() {
+        let ubox = [(0.0, 1.0), (0.0, 1.0)];
+        // u0 + u1 <= 1  ->  -u0 - u1 >= -1
+        let hs = [HalfSpace { a: vec![-1.0, -1.0], b: -1.0, aa: 2.0 }];
+        // Feasible point is unchanged.
+        let mut u = vec![0.2, 0.1];
+        project_onto_polytope(&mut u, &ubox, &hs, 1e-12, 500);
+        assert_relative_eq!(u[0], 0.2, epsilon = 1e-10);
+        assert_relative_eq!(u[1], 0.1, epsilon = 1e-10);
+        // Onto the half-space.
+        let mut u = vec![1.0, 1.0];
+        project_onto_polytope(&mut u, &ubox, &hs, 1e-12, 500);
+        assert_relative_eq!(u[0], 0.5, epsilon = 1e-9);
+        assert_relative_eq!(u[1], 0.5, epsilon = 1e-9);
+        // Onto a vertex of box ∩ half-space: nearest feasible point to
+        // (1.5, -0.2) in the triangle (0,0),(1,0),(0,1) is the corner (1,0).
+        let mut u = vec![1.5, -0.2];
+        project_onto_polytope(&mut u, &ubox, &hs, 1e-12, 500);
+        assert_relative_eq!(u[0], 1.0, epsilon = 1e-9);
+        assert_relative_eq!(u[1], 0.0, epsilon = 1e-9);
+        // Two half-spaces: u0 >= 0.6 and u0 + u1 <= 1, from (0.2, 0.9) ->
+        // the projection onto the segment u0 = 0.6, u1 <= 0.4 is (0.6, 0.4).
+        let hs2 = [
+            HalfSpace { a: vec![1.0, 0.0], b: 0.6, aa: 1.0 },
+            HalfSpace { a: vec![-1.0, -1.0], b: -1.0, aa: 2.0 },
+        ];
+        let mut u = vec![0.2, 0.9];
+        project_onto_polytope(&mut u, &ubox, &hs2, 1e-12, 500);
+        assert_relative_eq!(u[0], 0.6, epsilon = 1e-9);
+        assert_relative_eq!(u[1], 0.4, epsilon = 1e-9);
+    }
+
+    /// CMA-ES with a linear constraint stays CMA-ES (no COBYLA upgrade) and
+    /// never evaluates an infeasible point.
+    #[test]
+    fn test_cmaes_mirrors_across_linear_constraint() {
+        let bounds = vec![(0.0, 2.0), (0.0, 2.0)];
+        let linear = [LinearConstraint::ge(vec![1.0, 1.0], 1.0)]; // optimum (0.5, 0.5), f = 0.5
+        let checked = |x: &[f64]| {
+            assert!(x[0] + x[1] - 1.0 >= -1e-9, "evaluated an infeasible point {:?}", x);
+            sphere(x)
+        };
+        for handling in [ConstraintHandling::UpgradeToCobyla, ConstraintHandling::KeepAlgorithm] {
+            let options = LocalOptimizerOptions {
+                algorithm: LocalOptimizer::Cmaes,
+                constraint_handling: handling,
+                ..Default::default()
+            };
+            let r = minimize_local_with_constraints(checked, &[1.5, 1.5], &bounds, &[], &linear, &options);
+            assert!(r.success, "{:?}: {}", handling, r.message);
+            assert!(r.message.contains("CMA-ES"), "{:?}: {}", handling, r.message);
+            assert_relative_eq!(r.fun, 0.5, epsilon = 1e-6);
+            assert_relative_eq!(r.x[0], 0.5, epsilon = 1e-3);
+            assert_relative_eq!(r.x[1], 0.5, epsilon = 1e-3);
+        }
+        // A start outside the polytope is projected in first.
+        let options = LocalOptimizerOptions {
+            algorithm: LocalOptimizer::Cmaes,
+            ..Default::default()
+        };
+        let r = minimize_local_with_constraints(checked, &[0.1, 0.1], &bounds, &[], &linear, &options);
+        assert!(r.success, "{}", r.message);
+        assert_relative_eq!(r.fun, 0.5, epsilon = 1e-6);
+    }
+
+    /// Nonlinear closure constraints under `KeepAlgorithm`: the penalty path
+    /// keeps every objective evaluation feasible and lands on the boundary.
+    #[test]
+    fn test_cmaes_penalty_for_nonlinear_constraints() {
+        let bounds = vec![(0.0, 2.0), (0.0, 2.0)];
+        let constraints: Vec<BoxedConstraint> = vec![Box::new(|x: &[f64]| x[0] + x[1] - 1.0)];
+        let checked = |x: &[f64]| {
+            assert!(x[0] + x[1] - 1.0 >= -1e-8, "evaluated an infeasible point {:?}", x);
+            sphere(x)
+        };
+        let options = LocalOptimizerOptions {
+            algorithm: LocalOptimizer::Cmaes,
+            constraint_handling: ConstraintHandling::KeepAlgorithm,
+            maxeval: Some(4000),
+            ..Default::default()
+        };
+        let r = minimize_local_constrained(checked, &[1.5, 1.5], &bounds, &constraints, &options);
+        assert!(r.success, "{}", r.message);
+        assert!(r.message.contains("CMA-ES"), "{}", r.message);
+        assert!(r.x[0] + r.x[1] - 1.0 >= -1e-8);
+        assert_relative_eq!(r.fun, 0.5, epsilon = 1e-3);
+        // Infeasible start and nothing feasible reachable: reported as failure.
+        let impossible: Vec<BoxedConstraint> = vec![Box::new(|_: &[f64]| -1.0)];
+        let r = minimize_local_constrained(sphere, &[1.0, 1.0], &bounds, &impossible, &options);
+        assert!(!r.success);
+        assert!(r.message.contains("no feasible point"), "{}", r.message);
+        assert_eq!(r.nfev, 0, "the objective must not be evaluated at infeasible points");
+    }
+
+    /// `KeepAlgorithm` wraps bound-only NLopt methods in AUGLAG instead of
+    /// switching to COBYLA.
+    #[test]
+    fn test_auglag_keeps_algorithm() {
+        let bounds = vec![(0.0, 2.0), (0.0, 2.0)];
+        let constraints: Vec<BoxedConstraint> = vec![Box::new(|x: &[f64]| x[0] + x[1] - 1.0)];
+        let linear = [LinearConstraint::ge(vec![1.0, 1.0], 1.0)];
+        for alg in [LocalOptimizer::Bobyqa, LocalOptimizer::Sbplx, LocalOptimizer::NelderMead] {
+            let options = LocalOptimizerOptions {
+                algorithm: alg,
+                constraint_handling: ConstraintHandling::KeepAlgorithm,
+                maxeval: Some(5000),
+                ..Default::default()
+            };
+            // Closure constraint.
+            let r = minimize_local_constrained(sphere, &[1.5, 1.5], &bounds, &constraints, &options);
+            assert!(r.success, "{:?}: {}", alg, r.message);
+            assert!(r.message.contains("AUGLAG"), "{:?}: {}", alg, r.message);
+            assert!(r.x[0] + r.x[1] - 1.0 >= -1e-6, "{:?} violated the constraint: {:?}", alg, r.x);
+            assert_relative_eq!(r.fun, 0.5, epsilon = 1e-4);
+            // Linear constraint, same answer.
+            let r = minimize_local_with_constraints(sphere, &[1.5, 1.5], &bounds, &[], &linear, &options);
+            assert!(r.success, "{:?}: {}", alg, r.message);
+            assert!(r.message.contains("AUGLAG"), "{:?}: {}", alg, r.message);
+            assert_relative_eq!(r.fun, 0.5, epsilon = 1e-4);
+        }
+        // Default handling still upgrades to COBYLA.
+        let options = LocalOptimizerOptions {
+            algorithm: LocalOptimizer::Bobyqa,
+            ..Default::default()
+        };
+        let r = minimize_local_constrained(sphere, &[1.5, 1.5], &bounds, &constraints, &options);
+        assert!(r.message.contains("Cobyla") && !r.message.contains("AUGLAG"), "{}", r.message);
+    }
+
+    #[test]
+    fn test_linear_constraints_all_native_algorithms() {
+        let bounds = vec![(0.0, 2.0), (0.0, 2.0)];
+        let linear = [LinearConstraint::le(vec![-1.0, -1.0], -1.0)]; // x0 + x1 >= 1
+        for alg in [LocalOptimizer::Bobyqa, LocalOptimizer::Cobyla, LocalOptimizer::Slsqp, LocalOptimizer::Cmaes] {
+            let options = LocalOptimizerOptions {
+                algorithm: alg,
+                ..Default::default()
+            };
+            let r = minimize_local_with_constraints(sphere, &[1.5, 1.5], &bounds, &[], &linear, &options);
+            assert!(r.success, "{:?}: {}", alg, r.message);
+            assert!(r.x[0] + r.x[1] - 1.0 >= -1e-6, "{:?} violated the constraint", alg);
+            assert_relative_eq!(r.fun, 0.5, epsilon = 1e-4);
+        }
+        // Wrong coefficient count is rejected up front.
+        let bad = [LinearConstraint::ge(vec![1.0], 0.0)];
+        let r = minimize_local_with_constraints(sphere, &[1.5, 1.5], &bounds, &[], &bad, &LocalOptimizerOptions::default());
+        assert!(!r.success);
+        assert!(r.message.contains("Dimension mismatch"));
     }
 }

@@ -18,7 +18,7 @@ examples that write `use shgo_rs::…` fail to compile as doctests.
 
 ```bash
 cargo build --release              # fat LTO + codegen-units=1: slow link, expected
-cargo test                         # 136 unit + 21 doctests green; see cross-validation note below
+cargo test                         # 144 unit + 22 doctests green; see cross-validation note below
 cargo test --release <test_name>   # run a single test by substring
 cargo test --test cross_validation # Rust vs Python fixture comparison only
 cargo bench                        # criterion benchmarks (benches/benchmarks.rs)
@@ -119,8 +119,28 @@ Shared infrastructure:
   deterministic; `x0` is evaluated first and kept as incumbent (result never worse than
   the start); `CmaesOptions.sigma0` is a fraction of bound width and `initial_step` is
   ignored for CMA-ES. `examples/local_optimizer_benchmark.rs` is the BOBYQA / L-BFGS /
-  Nelder-Mead / Subplex / CMA-ES shoot-out (rugged, noisy, plateau landscapes); its
-  numbers are in the README.
+  Nelder-Mead / Subplex / CMA-ES shoot-out (rugged, noisy, plateau landscapes, plus
+  constrained variants); its numbers are in the README.
+  Constraints: closures (`g(x) >= 0`) and explicit `LinearConstraint`s (`a·x >= b`;
+  `Shgo::with_linear_constraints`, `minimize_local_with_constraints`). Which algorithm
+  runs is decided by `effective_algorithm(options, has_nonlinear, has_linear)`: COBYLA
+  and SLSQP take both natively, CMA-ES takes linear ones natively (every sample is
+  mirrored across a violated half-space in normalised coordinates, alternating with the
+  box fold; Dykstra projection `project_onto_polytope` is only the fallback when
+  mirroring does not settle — plain projection was tried first and stalls on the
+  boundary because the repaired region is flat, see the constrained rugged-bowl numbers
+  in the README), and everything else follows
+  `LocalOptimizerOptions::constraint_handling`: `UpgradeToCobyla` (default, the old
+  behaviour) or `KeepAlgorithm`, which wraps NLopt methods in `Algorithm::Auglag` with
+  the chosen method as `set_local_optimizer` subsidiary (result message carries
+  `AUGLAG(Bobyqa)` etc.) and gives CMA-ES a feasibility-first penalty for nonlinear
+  closures (infeasible samples are not evaluated, so they cost no `nfev`, and rank above
+  the start point by their violation; the returned point is always feasible or the run
+  is a failure). shgo.rs no longer decides the upgrade itself; it only warns when
+  `effective_algorithm` differs from the requested one. Linear constraints join the
+  sampling feasibility filter through `Shgo::feasibility_checks` (boxed predicates) and
+  the robustness stencil through `evaluate_points`. The C API does not expose linear
+  constraints or `constraint_handling` yet.
   Gradient-based algorithms (`Slsqp`, `Lbfgs`) receive forward finite-difference
   gradients (SciPy's `'2-point'` scheme, rayon-parallel across coordinates, counted in
   `nfev`) for the objective and for constraints; NLopt's line-search `Failure` /

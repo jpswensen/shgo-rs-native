@@ -91,6 +91,9 @@ pub type ConstraintFn = dyn Fn(&[f64]) -> f64 + Send + Sync;
 /// Type alias for bounds specification.
 pub type Bounds = Vec<(f64, f64)>;
 
+/// A boxed feasibility predicate used by the sampling stage.
+type FeasibilityCheck = Box<dyn Fn(&[f64]) -> bool + Send + Sync>;
+
 /// Sampling method for generating vertices.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[derive(Default)]
@@ -1015,6 +1018,9 @@ where
     bounds: Bounds,
     /// Inequality constraints: g(x) >= 0.
     constraints: Vec<Arc<G>>,
+    /// Linear inequality constraints `a · x >= b` (see
+    /// [`with_linear_constraints`](Self::with_linear_constraints)).
+    linear_constraints: Vec<crate::local_opt::LinearConstraint>,
     /// Optimization options.
     options: ShgoOptions,
     /// Dimension of the problem.
@@ -1054,6 +1060,7 @@ where
             func: Arc::new(func),
             bounds,
             constraints: Vec::new(),
+            linear_constraints: Vec::new(),
             options: ShgoOptions::default(),
             dim,
             fev_count: Arc::new(AtomicUsize::new(0)),
@@ -1114,11 +1121,73 @@ where
             func: Arc::new(func),
             bounds,
             constraints: constraints.into_iter().map(Arc::new).collect(),
+            linear_constraints: Vec::new(),
             options: ShgoOptions::default(),
             dim,
             fev_count: Arc::new(AtomicUsize::new(0)),
             cancelled: Arc::new(AtomicBool::new(false)),
         }
+    }
+
+    /// Add linear inequality constraints `a · x >= b`
+    /// ([`LinearConstraint`](crate::local_opt::LinearConstraint)).
+    ///
+    /// They filter the sampled vertices like closure constraints do, but are
+    /// passed to the local optimizer as linear, so CMA-ES mirrors samples
+    /// across them instead of being upgraded to COBYLA. Coefficient vectors must have one
+    /// entry per dimension; `minimize` rejects anything else with
+    /// `InvalidOption`.
+    ///
+    /// ```
+    /// use shgo::{LinearConstraint, Shgo};
+    ///
+    /// let sphere = |x: &[f64]| x.iter().map(|xi| xi.powi(2)).sum::<f64>();
+    /// let optimizer = Shgo::new(sphere, vec![(-5.0, 5.0); 2])
+    ///     .with_linear_constraints(vec![LinearConstraint::ge(vec![1.0, 1.0], 1.0)]);
+    /// ```
+    pub fn with_linear_constraints(
+        mut self,
+        constraints: Vec<crate::local_opt::LinearConstraint>,
+    ) -> Self {
+        self.linear_constraints = constraints;
+        self
+    }
+
+    /// `true` when any constraint (closure or linear) is registered.
+    fn has_constraints(&self) -> bool {
+        !self.constraints.is_empty() || !self.linear_constraints.is_empty()
+    }
+
+    /// Closure constraints boxed for the local optimizer.
+    fn boxed_constraints(&self) -> Vec<crate::local_opt::BoxedConstraint> {
+        self.constraints
+            .iter()
+            .map(|c| {
+                let c = Arc::clone(c);
+                Box::new(move |x: &[f64]| c(x)) as crate::local_opt::BoxedConstraint
+            })
+            .collect()
+    }
+
+    /// Feasibility predicates for the sampling stage (closures and linear
+    /// constraints alike; `None` when there are no constraints).
+    fn feasibility_checks(&self) -> Option<Vec<FeasibilityCheck>> {
+        if !self.has_constraints() {
+            return None;
+        }
+        let mut checks: Vec<FeasibilityCheck> = self
+            .constraints
+            .iter()
+            .map(|c| {
+                let c = Arc::clone(c);
+                Box::new(move |x: &[f64]| -> bool { c(x) >= 0.0 }) as FeasibilityCheck
+            })
+            .collect();
+        for lc in &self.linear_constraints {
+            let lc = lc.clone();
+            checks.push(Box::new(move |x: &[f64]| -> bool { lc.value(x) >= 0.0 }));
+        }
+        Some(checks)
     }
 
     /// Set optimization options.
@@ -1151,6 +1220,13 @@ where
     /// Returns `Ok(ShgoResult)` with the optimization results, or `Err(ShgoError)`
     /// if the optimization fails.
     pub fn minimize(&self) -> Result<ShgoResult, ShgoError> {
+        if let Some(bad) = self.linear_constraints.iter().find(|c| c.a.len() != self.dim) {
+            return Err(ShgoError::InvalidOption(format!(
+                "linear constraint has {} coefficients but the problem has {} dimensions",
+                bad.a.len(),
+                self.dim
+            )));
+        }
         // If workers is specified, use a custom thread pool
         if let Some(num_workers) = self.options.workers {
             let pool = rayon::ThreadPoolBuilder::new()
@@ -1504,20 +1580,8 @@ where
             func(x)
         };
 
-        // Wrap constraints to convert f64 >= 0 to bool
-        let wrapped_constraints: Option<Vec<_>> = if self.constraints.is_empty() {
-            None
-        } else {
-            Some(
-                self.constraints
-                    .iter()
-                    .map(|c| {
-                        let c = Arc::clone(c);
-                        move |x: &[f64]| -> bool { c(x) >= 0.0 }
-                    })
-                    .collect(),
-            )
-        };
+        // Constraints (closures and linear) as feasibility predicates.
+        let wrapped_constraints = self.feasibility_checks();
 
         // Create the simplicial complex
         let mut complex = Complex::new(
@@ -1718,20 +1782,8 @@ where
             func(x)
         };
 
-        // Wrap constraints to convert f64 >= 0 to bool
-        let wrapped_constraints: Option<Vec<_>> = if self.constraints.is_empty() {
-            None
-        } else {
-            Some(
-                self.constraints
-                    .iter()
-                    .map(|c| {
-                        let c = Arc::clone(c);
-                        move |x: &[f64]| -> bool { c(x) >= 0.0 }
-                    })
-                    .collect(),
-            )
-        };
+        // Constraints (closures and linear) as feasibility predicates.
+        let wrapped_constraints = self.feasibility_checks();
 
         // Create vertex cache
         let cache = VertexCache::new(
@@ -2666,19 +2718,22 @@ where
             return cache.get(&coords);
         }
 
-        // Create options for local optimization
-        let mut local_opts = self.options.local_options.clone();
-
-        // Auto-upgrade: if constraints exist but the chosen algorithm doesn't
-        // support them, switch to Cobyla (which does).
-        if !self.constraints.is_empty() && !local_opts.algorithm.supports_constraints() {
-            if self.options.disp > 0 {
+        // Options for local optimization. Constraint handling (COBYLA
+        // upgrade, AUGLAG wrapping, CMA-ES projection) is decided by the
+        // local optimizer; warn when it changes the algorithm.
+        let local_opts = self.options.local_options.clone();
+        if self.options.disp > 0 {
+            let effective = crate::local_opt::effective_algorithm(
+                &local_opts,
+                !self.constraints.is_empty(),
+                !self.linear_constraints.is_empty(),
+            );
+            if effective != local_opts.algorithm {
                 eprintln!(
-                    "Warning: {:?} does not support constraints, auto-upgrading to Cobyla",
-                    local_opts.algorithm
+                    "Warning: {:?} does not support constraints, auto-upgrading to {:?}",
+                    local_opts.algorithm, effective
                 );
             }
-            local_opts.algorithm = crate::local_opt::LocalOptimizer::Cobyla;
         }
 
         // Clone the function for local optimization (without evaluation counting,
@@ -2686,24 +2741,13 @@ where
         let func = Arc::clone(&self.func);
 
         // Run local optimization with constraints if available
-        let result = if !self.constraints.is_empty()
-            && local_opts.algorithm.supports_constraints()
-        {
-            // Build constraint wrappers for NLOPT (g(x) >= 0 convention)
-            let constraint_fns: Vec<crate::local_opt::BoxedConstraint> = self
-                .constraints
-                .iter()
-                .map(|c| {
-                    let c = Arc::clone(c);
-                    Box::new(move |x: &[f64]| c(x)) as crate::local_opt::BoxedConstraint
-                })
-                .collect();
-
-            crate::local_opt::minimize_local_constrained(
+        let result = if self.has_constraints() {
+            crate::local_opt::minimize_local_with_constraints(
                 |x: &[f64]| func(x),
                 x0,
                 local_bounds,
-                &constraint_fns,
+                &self.boxed_constraints(),
+                &self.linear_constraints,
                 &local_opts,
             )
         } else {
@@ -2811,6 +2855,7 @@ where
     fn evaluate_points(&self, points: &[Vec<f64>]) -> (Vec<Option<f64>>, usize) {
         let func = &self.func;
         let cons = &self.constraints;
+        let linear = &self.linear_constraints;
         let calls = AtomicUsize::new(0);
         let values: Vec<Option<f64>> = points
             .par_iter()
@@ -2819,7 +2864,8 @@ where
                 if cons.iter().any(|g| {
                     let v = g(p);
                     v.is_nan() || v < 0.0
-                }) {
+                }) || linear.iter().any(|c| c.value(p) < 0.0)
+                {
                     return None;
                 }
                 calls.fetch_add(1, Ordering::Relaxed);
@@ -2925,9 +2971,6 @@ where
         if let Some(me) = rp.maxeval {
             local_opts.maxeval = Some(me);
         }
-        if !self.constraints.is_empty() && !local_opts.algorithm.supports_constraints() {
-            local_opts.algorithm = crate::local_opt::LocalOptimizer::Cobyla;
-        }
 
         let mut out = Vec::with_capacity(chosen.len());
         let mut total = 0usize;
@@ -2942,7 +2985,7 @@ where
                 let feasible: Vec<f64> = values.into_iter().flatten().collect();
                 robust_aggregate(&feasible, rp.aggregate)
             };
-            let res = if self.constraints.is_empty() {
+            let res = if !self.has_constraints() {
                 crate::local_opt::minimize_local(
                     &smoothed,
                     &x0,
@@ -2951,19 +2994,12 @@ where
                     &local_opts,
                 )
             } else {
-                let cons: Vec<crate::local_opt::BoxedConstraint> = self
-                    .constraints
-                    .iter()
-                    .map(|c| {
-                        let c = Arc::clone(c);
-                        Box::new(move |x: &[f64]| c(x)) as crate::local_opt::BoxedConstraint
-                    })
-                    .collect();
-                crate::local_opt::minimize_local_constrained(
+                crate::local_opt::minimize_local_with_constraints(
                     smoothed,
                     &x0,
                     &self.bounds,
-                    &cons,
+                    &self.boxed_constraints(),
+                    &self.linear_constraints,
                     &local_opts,
                 )
             };
@@ -4349,6 +4385,87 @@ mod tests {
             .unwrap();
         assert!(result.x[0] + result.x[1] - 1.0 >= -1e-6, "x = {:?}", result.x);
         assert!((result.fun - 0.5).abs() < 1e-4, "fun = {}", result.fun);
+    }
+
+    /// Linear constraints filter the samples, reach the local optimizer as
+    /// linear (CMA-ES projects instead of becoming COBYLA), and the
+    /// `constraint_handling` setting selects AUGLAG for bound-only methods.
+    #[test]
+    fn test_shgo_linear_constraints() {
+        use crate::local_opt::{
+            ConstraintHandling, LinearConstraint, LocalOptimizer, LocalOptimizerOptions,
+        };
+
+        let bounds = vec![(-5.0, 5.0), (-5.0, 5.0)];
+        // x0 + x1 >= 1: constrained optimum (0.5, 0.5), f = 0.5.
+        let linear = vec![LinearConstraint::ge(vec![1.0, 1.0], 1.0)];
+        let cases = [
+            (LocalOptimizer::Bobyqa, ConstraintHandling::UpgradeToCobyla),
+            (LocalOptimizer::Bobyqa, ConstraintHandling::KeepAlgorithm),
+            (LocalOptimizer::Sbplx, ConstraintHandling::KeepAlgorithm),
+            (LocalOptimizer::Cmaes, ConstraintHandling::UpgradeToCobyla),
+        ];
+        for (algorithm, constraint_handling) in cases {
+            let options = ShgoOptions {
+                sampling_method: SamplingMethod::Sobol,
+                n: 64,
+                maxiter: Some(2),
+                local_options: LocalOptimizerOptions {
+                    algorithm,
+                    constraint_handling,
+                    maxeval: Some(4000),
+                    ..LocalOptimizerOptions::default()
+                },
+                ..Default::default()
+            };
+            let result = Shgo::new(sphere, bounds.clone())
+                .with_linear_constraints(linear.clone())
+                .with_options(options)
+                .minimize()
+                .unwrap();
+            assert!(
+                result.x[0] + result.x[1] - 1.0 >= -1e-6,
+                "{:?}/{:?}: infeasible x = {:?}",
+                algorithm,
+                constraint_handling,
+                result.x
+            );
+            assert!(
+                (result.fun - 0.5).abs() < 1e-3,
+                "{:?}/{:?}: fun = {}",
+                algorithm,
+                constraint_handling,
+                result.fun
+            );
+            // Every retained local minimum is feasible: the sampling filter
+            // and the local runs both honour the constraint.
+            for xl in &result.xl {
+                assert!(xl[0] + xl[1] - 1.0 >= -1e-6, "infeasible xl {:?}", xl);
+            }
+        }
+
+        // Mixed closure + linear constraints through the same path.
+        let constraint = |x: &[f64]| 1.5 - x[0]; // x0 <= 1.5
+        let result = Shgo::with_constraints(sphere, bounds.clone(), vec![constraint])
+            .with_linear_constraints(linear.clone())
+            .with_options(ShgoOptions {
+                sampling_method: SamplingMethod::Sobol,
+                n: 64,
+                maxiter: Some(2),
+                ..Default::default()
+            })
+            .minimize()
+            .unwrap();
+        assert!(result.x[0] + result.x[1] - 1.0 >= -1e-6, "x = {:?}", result.x);
+        assert!(result.x[0] <= 1.5 + 1e-6);
+        assert!((result.fun - 0.5).abs() < 1e-3, "fun = {}", result.fun);
+
+        // Wrong coefficient count is an option error.
+        let err = Shgo::new(sphere, bounds)
+            .with_linear_constraints(vec![LinearConstraint::ge(vec![1.0], 0.0)])
+            .minimize()
+            .unwrap_err();
+        assert!(matches!(err, ShgoError::InvalidOption(_)), "{:?}", err);
     }
 
     #[test]

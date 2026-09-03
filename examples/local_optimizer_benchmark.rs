@@ -18,12 +18,25 @@
 //!
 //! Part A runs every optimizer alone from the same fixed starting points.
 //! Part B runs the same problems through SHGO (Sobol + k-NN, coarse `n`) so
-//! the interaction with the minimizer pool is visible. Both parts print
+//! the interaction with the minimizer pool is visible.
+//!
+//! Parts C and D repeat both with an active linear constraint
+//! `x0 + x1 <= c0 + c1 - 0.53` (the unconstrained optimum is cut off; the
+//! offset is not a multiple of the step function's plateau width, so no
+//! plateau corner sits exactly on the constraint), comparing the COBYLA fallback
+//! with SLSQP, BOBYQA and Subplex inside NLopt's augmented Lagrangian
+//! (`ConstraintHandling::KeepAlgorithm`), and CMA-ES projecting onto the
+//! constraint. The reference value for each constrained problem is the best
+//! feasible value any method found (the noisy problem uses the analytic
+//! constrained optimum of its noise-free ellipsoid). All parts print
 //! Markdown tables.
 //!
 //! Run: cargo run --release --example local_optimizer_benchmark [quick]
 
-use shgo::local_opt::{minimize_local, CmaesOptions, LocalOptimizer, LocalOptimizerOptions};
+use shgo::local_opt::{
+    minimize_local, minimize_local_with_constraints, CmaesOptions, ConstraintHandling,
+    LinearConstraint, LocalOptimizer, LocalOptimizerOptions,
+};
 use shgo::{ConnectivityMethod, SamplingMethod, Shgo, ShgoOptions};
 use std::sync::Arc;
 use std::time::Instant;
@@ -159,6 +172,37 @@ struct Problem {
     success_tol: f64,
     /// SHGO sampling size for part B
     shgo_n: usize,
+    /// Per-axis weights of the (noise-free) ellipsoid, when the problem is one:
+    /// lets the constrained optimum be computed analytically.
+    ellipsoid_weights: Option<Vec<f64>>,
+}
+
+/// The constrained variant: `x0 + x1 <= x*_0 + x*_1 - 0.53`, which cuts off
+/// the unconstrained optimum along the diagonal. The offset deliberately is
+/// not a multiple of the step function's plateau width (0.1), so no plateau
+/// corner lies exactly on the constraint where a tolerance-level violation
+/// would reach a lower plateau.
+const CONSTRAINT_OFFSET: f64 = 0.53;
+fn active_constraint(p: &Problem) -> LinearConstraint {
+    let mut a = vec![0.0; p.dim];
+    a[0] = 1.0;
+    a[1] = 1.0;
+    LinearConstraint::le(a, p.x_star[0] + p.x_star[1] - CONSTRAINT_OFFSET)
+}
+
+/// Constrained optimum of `sum w_i (x_i - c_i)^2` subject to the active
+/// constraint `a·x = b`: `x = c + t W^-1 a` with `t = (b - a·c) / (aᵀ W^-1 a)`.
+fn constrained_ellipsoid_optimum(c: &[f64], w: &[f64], lc: &LinearConstraint) -> Vec<f64> {
+    // `lc` stores `-a·x >= -b`; recover a·x = b with a = -lc.a, b = -lc.b.
+    let a: Vec<f64> = lc.a.iter().map(|v| -v).collect();
+    let b = -lc.b;
+    let ac: f64 = a.iter().zip(c).map(|(ai, ci)| ai * ci).sum();
+    let awa: f64 = a.iter().zip(w).map(|(ai, wi)| ai * ai / wi).sum();
+    let t = (b - ac) / awa;
+    c.iter()
+        .zip(a.iter().zip(w))
+        .map(|(ci, (ai, wi))| ci + t * ai / wi)
+        .collect()
 }
 
 impl Problem {
@@ -190,6 +234,7 @@ fn problems(quick: bool) -> Vec<Problem> {
             metric: Metric::FunGap,
             success_tol: 1e-6,
             shgo_n: 256,
+            ellipsoid_weights: None,
         });
     }
     {
@@ -208,6 +253,7 @@ fn problems(quick: bool) -> Vec<Problem> {
             metric: Metric::FunGap,
             success_tol: 1e-6,
             shgo_n: 512,
+            ellipsoid_weights: None,
         });
     }
     for &dim in if quick { &[4usize][..] } else { &[4usize, 10][..] } {
@@ -224,6 +270,7 @@ fn problems(quick: bool) -> Vec<Problem> {
             // any ripple minimum other than the central one has f >= ~0.11
             success_tol: 1e-3,
             shgo_n: if dim == 4 { 128 } else { 512 },
+            ellipsoid_weights: None,
         });
     }
     {
@@ -231,17 +278,19 @@ fn problems(quick: bool) -> Vec<Problem> {
         let c = shift(dim);
         let w = ellipsoid_weights(dim, 2.0);
         let c2 = c.clone();
+        let w2 = w.clone();
         v.push(Problem {
             name: "noisy-6d",
             dim,
             bounds: vec![(-5.0, 5.0); dim],
-            f: Arc::new(move |x: &[f64]| noisy_ellipsoid(x, &c2, &w)),
+            f: Arc::new(move |x: &[f64]| noisy_ellipsoid(x, &c2, &w2)),
             x_star: c,
             f_star: 0.0,
             metric: Metric::Distance,
             // within 0.1 of the optimum: f ~ 0.01 there, far below the noise
             success_tol: 0.1,
             shgo_n: 256,
+            ellipsoid_weights: Some(w),
         });
     }
     {
@@ -259,6 +308,7 @@ fn problems(quick: bool) -> Vec<Problem> {
             metric: Metric::FunGap,
             success_tol: 1e-12, // must land on the zero plateau
             shgo_n: 256,
+            ellipsoid_weights: None,
         });
     }
     v
@@ -273,16 +323,32 @@ struct Contender {
     algorithm: LocalOptimizer,
     /// CMA-ES population as a multiple of the crate default (ignored otherwise)
     pop_multiplier: usize,
+    handling: ConstraintHandling,
 }
 
 fn contenders() -> Vec<Contender> {
+    use ConstraintHandling::UpgradeToCobyla as U;
     vec![
-        Contender { name: "Bobyqa", algorithm: LocalOptimizer::Bobyqa, pop_multiplier: 1 },
-        Contender { name: "Lbfgs", algorithm: LocalOptimizer::Lbfgs, pop_multiplier: 1 },
-        Contender { name: "NelderMead", algorithm: LocalOptimizer::NelderMead, pop_multiplier: 1 },
-        Contender { name: "Sbplx", algorithm: LocalOptimizer::Sbplx, pop_multiplier: 1 },
-        Contender { name: "Cmaes", algorithm: LocalOptimizer::Cmaes, pop_multiplier: 1 },
-        Contender { name: "Cmaes-4xpop", algorithm: LocalOptimizer::Cmaes, pop_multiplier: 4 },
+        Contender { name: "Bobyqa", algorithm: LocalOptimizer::Bobyqa, pop_multiplier: 1, handling: U },
+        Contender { name: "Lbfgs", algorithm: LocalOptimizer::Lbfgs, pop_multiplier: 1, handling: U },
+        Contender { name: "NelderMead", algorithm: LocalOptimizer::NelderMead, pop_multiplier: 1, handling: U },
+        Contender { name: "Sbplx", algorithm: LocalOptimizer::Sbplx, pop_multiplier: 1, handling: U },
+        Contender { name: "Cmaes", algorithm: LocalOptimizer::Cmaes, pop_multiplier: 1, handling: U },
+        Contender { name: "Cmaes-4xpop", algorithm: LocalOptimizer::Cmaes, pop_multiplier: 4, handling: U },
+    ]
+}
+
+/// Contenders for the constrained parts. "Cobyla" is what any bound-only
+/// method becomes under the default handling.
+fn constrained_contenders() -> Vec<Contender> {
+    use ConstraintHandling::{KeepAlgorithm as K, UpgradeToCobyla as U};
+    vec![
+        Contender { name: "Cobyla", algorithm: LocalOptimizer::Cobyla, pop_multiplier: 1, handling: U },
+        Contender { name: "Slsqp", algorithm: LocalOptimizer::Slsqp, pop_multiplier: 1, handling: U },
+        Contender { name: "Bobyqa+AugLag", algorithm: LocalOptimizer::Bobyqa, pop_multiplier: 1, handling: K },
+        Contender { name: "Sbplx+AugLag", algorithm: LocalOptimizer::Sbplx, pop_multiplier: 1, handling: K },
+        Contender { name: "Cmaes", algorithm: LocalOptimizer::Cmaes, pop_multiplier: 1, handling: U },
+        Contender { name: "Cmaes-4xpop", algorithm: LocalOptimizer::Cmaes, pop_multiplier: 4, handling: U },
     ]
 }
 
@@ -299,6 +365,7 @@ fn local_options(c: &Contender, dim: usize) -> LocalOptimizerOptions {
         xtol_rel: 1e-8,
         xtol_abs: 1e-14,
         maxeval: Some((1000 * dim) as u32),
+        constraint_handling: c.handling,
         cmaes: CmaesOptions {
             population_size: if c.pop_multiplier > 1 {
                 Some(c.pop_multiplier * default_population(dim))
@@ -435,6 +502,162 @@ fn part_b(problems: &[Problem]) {
     println!();
 }
 
+// ---------------------------------------------------------------------------
+// Parts C and D: an active linear constraint
+// ---------------------------------------------------------------------------
+
+/// One constrained run's outcome, kept until the reference value is known.
+struct ConstrainedRow {
+    problem: usize,
+    optimizer: &'static str,
+    through_shgo: bool,
+    /// per-start (fun, x, violation, nfev); one entry for SHGO runs
+    runs: Vec<(f64, Vec<f64>, f64, usize)>,
+    secs: f64,
+}
+
+fn constrained_error(p: &Problem, lc: &LinearConstraint, f_ref: f64, fun: f64, x: &[f64]) -> f64 {
+    match (p.metric, &p.ellipsoid_weights) {
+        (Metric::Distance, Some(w)) => {
+            let opt = constrained_ellipsoid_optimum(&p.x_star, w, lc);
+            x.iter().zip(&opt).map(|(a, b)| (a - b).powi(2)).sum::<f64>().sqrt()
+        }
+        _ => fun - f_ref,
+    }
+}
+
+fn parts_c_d(problems: &[Problem], starts: usize) {
+    let mut rows: Vec<ConstrainedRow> = Vec::new();
+    for (pi, p) in problems.iter().enumerate() {
+        let lc = active_constraint(p);
+        let x0s = starting_points(p, starts);
+        for c in constrained_contenders() {
+            let opts = local_options(&c, p.dim);
+            // Part C: alone.
+            let t = Instant::now();
+            let runs: Vec<_> = x0s
+                .iter()
+                .map(|x0| {
+                    let f = Arc::clone(&p.f);
+                    let r = minimize_local_with_constraints(
+                        |x: &[f64]| f(x),
+                        x0,
+                        &p.bounds,
+                        &[],
+                        std::slice::from_ref(&lc),
+                        &opts,
+                    );
+                    let viol = (-lc.value(&r.x)).max(0.0);
+                    (r.fun, r.x, viol, r.nfev)
+                })
+                .collect();
+            rows.push(ConstrainedRow {
+                problem: pi,
+                optimizer: c.name,
+                through_shgo: false,
+                runs,
+                secs: t.elapsed().as_secs_f64(),
+            });
+            // Part D: through SHGO.
+            let f = Arc::clone(&p.f);
+            let t = Instant::now();
+            let r = Shgo::new(move |x: &[f64]| f(x), p.bounds.clone())
+                .with_linear_constraints(vec![lc.clone()])
+                .with_options(ShgoOptions {
+                    sampling_method: SamplingMethod::Sobol,
+                    connectivity_method: ConnectivityMethod::KNearestNeighbors,
+                    n: p.shgo_n,
+                    maxiter: Some(2),
+                    local_options: local_options(&c, p.dim),
+                    disp: 0,
+                    ..Default::default()
+                })
+                .minimize()
+                .unwrap();
+            let viol = (-lc.value(&r.x)).max(0.0);
+            rows.push(ConstrainedRow {
+                problem: pi,
+                optimizer: c.name,
+                through_shgo: true,
+                runs: vec![(r.fun, r.x.clone(), viol, r.nfev)],
+                secs: t.elapsed().as_secs_f64(),
+            });
+        }
+    }
+
+    // Reference: best feasible value seen for each problem, over both parts.
+    let f_ref: Vec<f64> = (0..problems.len())
+        .map(|pi| {
+            rows.iter()
+                .filter(|r| r.problem == pi)
+                .flat_map(|r| r.runs.iter())
+                .filter(|(_, _, viol, _)| *viol <= 1e-6)
+                .map(|(fun, _, _, _)| *fun)
+                .fold(f64::INFINITY, f64::min)
+        })
+        .collect();
+
+    println!("## Part C: local optimizer alone with an active linear constraint ({} starts)
+", starts);
+    println!("Error is relative to the best feasible value any method found for the problem (analytic constrained optimum for `noisy-6d`); a run with constraint violation above 1e-6 does not count as reached.
+");
+    println!("| problem | optimizer | reached | median err | worst err | worst violation | median nfev | time ms |");
+    println!("|---|---|---|---|---|---|---|---|");
+    for r in rows.iter().filter(|r| !r.through_shgo) {
+        let p = &problems[r.problem];
+        let lc = active_constraint(p);
+        let mut errs: Vec<f64> = Vec::new();
+        let mut nfevs: Vec<f64> = Vec::new();
+        let mut reached = 0;
+        let mut worst_viol: f64 = 0.0;
+        for (fun, x, viol, nfev) in &r.runs {
+            let e = constrained_error(p, &lc, f_ref[r.problem], *fun, x);
+            if e <= p.success_tol && *viol <= 1e-6 {
+                reached += 1;
+            }
+            errs.push(e);
+            nfevs.push(*nfev as f64);
+            worst_viol = worst_viol.max(*viol);
+        }
+        let worst = errs.iter().cloned().fold(f64::NEG_INFINITY, f64::max);
+        println!(
+            "| {} | {} | {}/{} | {:.1e} | {:.1e} | {:.1e} | {:.0} | {:.1} |",
+            p.name,
+            r.optimizer,
+            reached,
+            starts,
+            median(&mut errs),
+            worst,
+            worst_viol,
+            median(&mut nfevs),
+            r.secs * 1e3
+        );
+    }
+    println!();
+
+    println!("## Part D: through SHGO with the same linear constraint (Sobol + k-NN, maxiter 2)
+");
+    println!("| problem | optimizer | reached | err | violation | nfev | time s |");
+    println!("|---|---|---|---|---|---|---|");
+    for r in rows.iter().filter(|r| r.through_shgo) {
+        let p = &problems[r.problem];
+        let lc = active_constraint(p);
+        let (fun, x, viol, nfev) = &r.runs[0];
+        let e = constrained_error(p, &lc, f_ref[r.problem], *fun, x);
+        println!(
+            "| {} | {} | {} | {:.1e} | {:.1e} | {} | {:.2} |",
+            p.name,
+            r.optimizer,
+            if e <= p.success_tol && *viol <= 1e-6 { "yes" } else { "no" },
+            e,
+            viol,
+            nfev,
+            r.secs
+        );
+    }
+    println!();
+}
+
 fn main() {
     let quick = std::env::args().any(|a| a == "quick");
     let problems = problems(quick);
@@ -446,4 +669,5 @@ fn main() {
     );
     part_a(&problems, starts);
     part_b(&problems);
+    parts_c_d(&problems, starts);
 }

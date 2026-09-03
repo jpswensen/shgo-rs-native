@@ -300,7 +300,15 @@ matching SciPy's re-triangulation semantics.
 | `LocalOptimizer::Praxis` | `LN_PRAXIS` | Principal axis method. |
 | `LocalOptimizer::NewuoaBound` | `LN_NEWUOA_BOUND` | NEWUOA with bound constraints. |
 | `LocalOptimizer::Sbplx` | `LN_SBPLX` | Subplex: Nelder-Mead restarted on low-dimensional subspaces. Tolerates noise and non-smoothness, scales better than Nelder-Mead. |
-| `LocalOptimizer::Cmaes` | — (`cmaes` crate) | CMA-ES, population based. Bounds enforced by per-coordinate normalisation plus reflection; constraints upgrade to COBYLA. Seeded from the start point, so runs are deterministic. Tuned via `local_options.cmaes` (`CmaesOptions`: `sigma0`, `population_size`, `seed`, `parallel_eval`, `eval_final_mean`). See [Choosing between BOBYQA, Subplex and CMA-ES](#choosing-between-bobyqa-subplex-and-cma-es). |
+| `LocalOptimizer::Cmaes` | — (`cmaes` crate) | CMA-ES, population based. Bounds and linear constraints enforced by per-coordinate normalisation plus mirroring; nonlinear closure constraints upgrade to COBYLA by default. Seeded from the start point, so runs are deterministic. Tuned via `local_options.cmaes` (`CmaesOptions`: `sigma0`, `population_size`, `seed`, `parallel_eval`, `eval_final_mean`). See [Choosing between BOBYQA, Subplex and CMA-ES](#choosing-between-bobyqa-subplex-and-cma-es). |
+
+Constraints: COBYLA and SLSQP take closure constraints (`Shgo::with_constraints`,
+`g(x) >= 0`) and linear constraints (`Shgo::with_linear_constraints`,
+`LinearConstraint::ge/le`) natively; CMA-ES takes linear ones natively. For every
+other combination `local_options.constraint_handling` decides:
+`ConstraintHandling::UpgradeToCobyla` (default) or `KeepAlgorithm`, which wraps the
+NLopt method in NLopt's augmented Lagrangian (AUGLAG). See
+[Constraints: COBYLA fallback, AUGLAG, or CMA-ES](#constraints-cobyla-fallback-auglag-or-cma-es).
 
 ## Termination Criteria
 
@@ -494,6 +502,189 @@ let options = ShgoOptions {
     ..Default::default()
 };
 ```
+
+### Constraints: COBYLA fallback, AUGLAG, or CMA-ES
+
+Only COBYLA and SLSQP take inequality constraints natively in NLopt, so a
+constrained problem with the default BOBYQA used to run COBYLA, always. Two
+things change that:
+
+- **Linear constraints are a first-class kind.** `Shgo::with_linear_constraints`
+  takes `LinearConstraint::ge(a, b)` (`a · x >= b`) or `LinearConstraint::le`.
+  They filter the sampled vertices like closure constraints, but reach the
+  local optimizer as linear, which lets CMA-ES keep every sample feasible by
+  mirroring it across a violated constraint, the same fold it applies at the
+  bounds. Constraint violation of the returned point is exactly zero.
+- **`local_options.constraint_handling`** decides what happens when the
+  chosen algorithm has no native support. `UpgradeToCobyla` is the default and
+  the old behaviour. `KeepAlgorithm` wraps an NLopt method in NLopt's
+  augmented Lagrangian (`AUGLAG`) with the method as its subsidiary, so BOBYQA
+  or Subplex keep their character; the result satisfies the constraints to
+  about `constraint_tol`. For CMA-ES with nonlinear closure constraints it
+  switches on a feasibility-first penalty: an infeasible sample is not
+  evaluated (so it costs no `nfev`) and ranks below the start point by its
+  violation.
+
+| requested | closure constraints | linear constraints |
+|---|---|---|
+| `Cobyla`, `Slsqp` | native | native |
+| `Cmaes` | COBYLA (default) or penalty (`KeepAlgorithm`) | native (mirroring) |
+| any other NLopt method | COBYLA (default) or `AUGLAG(method)` (`KeepAlgorithm`) | same |
+
+`effective_algorithm(&options, has_closures, has_linear)` returns what will
+actually run; SHGO prints a warning at `disp > 0` when it differs from the
+request.
+
+```rust
+use shgo::{ConstraintHandling, LinearConstraint, LocalOptimizer, LocalOptimizerOptions, Shgo, ShgoOptions};
+
+// x0 + x1 <= 1  and  x2 >= 0.5 x3
+let linear = vec![
+    LinearConstraint::le(vec![1.0, 1.0, 0.0, 0.0], 1.0),
+    LinearConstraint::ge(vec![0.0, 0.0, 1.0, -0.5], 0.0),
+];
+let result = Shgo::new(objective, bounds)
+    .with_linear_constraints(linear)
+    .with_options(ShgoOptions {
+        local_options: LocalOptimizerOptions {
+            // CMA-ES mirrors samples across the constraints; alternatively
+            // LocalOptimizer::Sbplx with ConstraintHandling::KeepAlgorithm
+            // runs Subplex inside AUGLAG.
+            algorithm: LocalOptimizer::Cmaes,
+            constraint_handling: ConstraintHandling::UpgradeToCobyla,
+            maxeval: Some(10_000),
+            ..Default::default()
+        },
+        ..Default::default()
+    })
+    .minimize()?;
+```
+
+The benchmark's parts C and D repeat the problems above with an active linear
+constraint `x0 + x1 <= x*_0 + x*_1 - 0.53`, which cuts off the unconstrained
+optimum. "Cobyla" is what any bound-only method becomes under the default
+handling. The error is relative to the best feasible value any method found
+(the analytic constrained optimum of the noise-free ellipsoid for `noisy-6d`);
+a run counts as reached only if its constraint violation is at most 1e-6.
+
+**Local optimizer alone, 8 fixed starts:**
+
+| problem | optimizer | reached | median err | worst err | worst violation | median nfev | time ms |
+|---|---|---|---|---|---|---|---|
+| rosen-6d | Cobyla | 6/8 | 1.8e-8 | 2.0e0 | 6.7e-16 | 1350 | 24.4 |
+| rosen-6d | Slsqp | 5/8 | 1.8e-8 | 2.0e0 | 6.7e-16 | 336 | 30.7 |
+| rosen-6d | Bobyqa+AugLag | 6/8 | 1.7e-8 | 2.0e0 | 5.7e-9 | 2059 | 36.4 |
+| rosen-6d | Sbplx+AugLag | 0/8 | 5.8e2 | 1.5e3 | 0.0e0 | 6001 | 4.4 |
+| rosen-6d | Cmaes | 7/8 | 1.8e-8 | 2.0e0 | 0.0e0 | 2914 | 26.5 |
+| rosen-6d | Cmaes-4xpop | 8/8 | 1.8e-8 | 1.8e-8 | 0.0e0 | 5492 | 42.5 |
+| rotated-10d | Cobyla | 0/8 | 6.7e2 | 4.3e3 | 0.0e0 | 10000 | 280.7 |
+| rotated-10d | Slsqp | 0/8 | 3.8e6 | 1.0e7 | 3.4e0 | 11 | 1.7 |
+| rotated-10d | Bobyqa+AugLag | 0/8 | 1.3e6 | 6.6e6 | 1.3e-2 | 10001 | 582.4 |
+| rotated-10d | Sbplx+AugLag | 0/8 | 9.4e1 | 4.3e6 | 8.5e-1 | 10001 | 15.5 |
+| rotated-10d | Cmaes | 8/8 | 1.5e-12 | 1.4e-11 | 0.0e0 | 6782 | 82.5 |
+| rotated-10d | Cmaes-4xpop | 8/8 | 5.8e-12 | 5.2e-10 | 0.0e0 | 10002 | 97.6 |
+| rugged-4d | Cobyla | 1/8 | 2.1e-1 | 1.1e0 | 0.0e0 | 178 | 1.6 |
+| rugged-4d | Slsqp | 1/8 | 3.2e-1 | 2.8e0 | 0.0e0 | 146 | 17.0 |
+| rugged-4d | Bobyqa+AugLag | 0/8 | 9.6e-1 | 2.3e0 | 0.0e0 | 98 | 1.7 |
+| rugged-4d | Sbplx+AugLag | 2/8 | 1.6e-1 | 2.1e-1 | 0.0e0 | 1186 | 1.0 |
+| rugged-4d | Cmaes | 5/8 | 3.9e-13 | 2.1e-1 | 0.0e0 | 1030 | 7.8 |
+| rugged-4d | Cmaes-4xpop | 8/8 | 2.4e-14 | 4.7e-14 | 0.0e0 | 2434 | 16.8 |
+| rugged-10d | Cobyla | 0/8 | 2.1e0 | 5.9e0 | 0.0e0 | 818 | 28.5 |
+| rugged-10d | Slsqp | 0/8 | 1.7e0 | 4.2e0 | 0.0e0 | 526 | 33.4 |
+| rugged-10d | Bobyqa+AugLag | 0/8 | 1.3e0 | 3.3e0 | 0.0e0 | 502 | 19.2 |
+| rugged-10d | Sbplx+AugLag | 1/8 | 2.1e-1 | 6.4e-1 | 0.0e0 | 914 | 2.0 |
+| rugged-10d | Cmaes | 0/8 | 2.1e-1 | 4.3e-1 | 0.0e0 | 2472 | 30.3 |
+| rugged-10d | Cmaes-4xpop | 7/8 | 1.4e-13 | 1.1e-1 | 0.0e0 | 5802 | 58.5 |
+| noisy-6d | Cobyla | 0/8 | 8.5e-1 | 3.0e0 | 0.0e0 | 188 | 1.5 |
+| noisy-6d | Slsqp | 0/8 | 5.5e0 | 1.2e1 | 9.8e-1 | 7 | 2.1 |
+| noisy-6d | Bobyqa+AugLag | 2/8 | 3.5e-1 | 1.6e0 | 0.0e0 | 118 | 4.4 |
+| noisy-6d | Sbplx+AugLag | 1/8 | 1.7e-1 | 3.4e-1 | 0.0e0 | 1942 | 1.5 |
+| noisy-6d | Cmaes | 5/8 | 6.4e-2 | 1.7e-1 | 0.0e0 | 6005 | 54.3 |
+| noisy-6d | Cmaes-4xpop | 8/8 | 3.0e-2 | 7.6e-2 | 0.0e0 | 6014 | 48.3 |
+| step-5d | Cobyla | 0/8 | 5.8e0 | 2.9e1 | 0.0e0 | 130 | 1.1 |
+| step-5d | Slsqp | 0/8 | 1.1e3 | 1.7e3 | 1.1e-16 | 9 | 9.1 |
+| step-5d | Bobyqa+AugLag | 3/8 | 2.5e-2 | 9.3e-1 | 0.0e0 | 80 | 2.2 |
+| step-5d | Sbplx+AugLag | 8/8 | 0.0e0 | 0.0e0 | 0.0e0 | 1674 | 1.2 |
+| step-5d | Cmaes | 8/8 | 0.0e0 | 0.0e0 | 0.0e0 | 702 | 5.2 |
+| step-5d | Cmaes-4xpop | 8/8 | 0.0e0 | 0.0e0 | 0.0e0 | 1314 | 8.7 |
+
+**Through SHGO** (Sobol + k-NN, `maxiter: 2`, the constraint registered with
+`with_linear_constraints`):
+
+| problem | optimizer | reached | err | violation | nfev | time s |
+|---|---|---|---|---|---|---|
+| rosen-6d | Cobyla | yes | 1.8e-8 | 4.4e-16 | 14078 | 0.01 |
+| rosen-6d | Slsqp | yes | 1.8e-8 | 0.0e0 | 2432 | 0.00 |
+| rosen-6d | Bobyqa+AugLag | yes | 1.7e-8 | 4.6e-10 | 13017 | 0.02 |
+| rosen-6d | Sbplx+AugLag | no | 2.0e0 | 0.0e0 | 36412 | 0.00 |
+| rosen-6d | Cmaes | yes | 1.8e-8 | 0.0e0 | 17719 | 0.01 |
+| rosen-6d | Cmaes-4xpop | yes | 1.8e-8 | 0.0e0 | 31957 | 0.01 |
+| rotated-10d | Cobyla | no | 7.7e1 | 0.0e0 | 120567 | 0.10 |
+| rotated-10d | Slsqp | yes | 4.9e-8 | 3.3e-16 | 3453 | 0.01 |
+| rotated-10d | Bobyqa+AugLag | no | 9.7e4 | 0.0e0 | 130572 | 0.18 |
+| rotated-10d | Sbplx+AugLag | no | 3.9e0 | 0.0e0 | 130575 | 0.01 |
+| rotated-10d | Cmaes | yes | 5.3e-13 | 0.0e0 | 88523 | 0.03 |
+| rotated-10d | Cmaes-4xpop | yes | 3.8e-13 | 0.0e0 | 127673 | 0.04 |
+| rugged-4d | Cobyla | no | 1.1e-1 | 0.0e0 | 4895 | 0.01 |
+| rugged-4d | Slsqp | no | 1.1e-1 | 0.0e0 | 821 | 0.00 |
+| rugged-4d | Bobyqa+AugLag | no | 2.1e-1 | 0.0e0 | 629 | 0.00 |
+| rugged-4d | Sbplx+AugLag | yes | 1.3e-14 | 0.0e0 | 2892 | 0.00 |
+| rugged-4d | Cmaes | yes | 9.8e-14 | 0.0e0 | 5187 | 0.00 |
+| rugged-4d | Cmaes-4xpop | yes | 4.2e-14 | 0.0e0 | 12731 | 0.01 |
+| rugged-10d | Cobyla | no | 8.6e-1 | 0.0e0 | 1695 | 0.01 |
+| rugged-10d | Slsqp | no | 3.2e-1 | 0.0e0 | 1647 | 0.01 |
+| rugged-10d | Bobyqa+AugLag | no | 7.5e-1 | 0.0e0 | 1394 | 0.01 |
+| rugged-10d | Sbplx+AugLag | no | 3.2e-1 | 0.0e0 | 2406 | 0.00 |
+| rugged-10d | Cmaes | no | 3.2e-1 | 0.0e0 | 5704 | 0.01 |
+| rugged-10d | Cmaes-4xpop | yes | 1.7e-13 | 0.0e0 | 12244 | 0.02 |
+| noisy-6d | Cobyla | no | 4.2e-1 | 0.0e0 | 1209 | 0.00 |
+| noisy-6d | Slsqp | no | 3.8e0 | 0.0e0 | 356 | 0.00 |
+| noisy-6d | Bobyqa+AugLag | yes | 9.9e-2 | 0.0e0 | 1820 | 0.00 |
+| noisy-6d | Sbplx+AugLag | no | 1.1e-1 | 0.0e0 | 6783 | 0.00 |
+| noisy-6d | Cmaes | yes | 6.5e-2 | 0.0e0 | 30311 | 0.02 |
+| noisy-6d | Cmaes-4xpop | yes | 3.3e-2 | 0.0e0 | 30356 | 0.01 |
+| step-5d | Cobyla | no | 2.1e0 | 0.0e0 | 884 | 0.00 |
+| step-5d | Slsqp | no | 1.9e1 | 0.0e0 | 319 | 0.00 |
+| step-5d | Bobyqa+AugLag | no | 2.5e-2 | 0.0e0 | 1082 | 0.00 |
+| step-5d | Sbplx+AugLag | yes | 0.0e0 | 0.0e0 | 3442 | 0.00 |
+| step-5d | Cmaes | yes | 0.0e0 | 0.0e0 | 4203 | 0.00 |
+| step-5d | Cmaes-4xpop | yes | 0.0e0 | 0.0e0 | 8203 | 0.00 |
+
+What to take from it:
+
+- **The COBYLA fallback is the weakest option everywhere except the smooth
+  valley.** It fails outright on the ill-conditioned rotated ellipsoid (error
+  670 after the full 10 000-evaluation budget, 77 through SHGO) and reaches
+  none of the rugged, noisy or plateau problems from the fixed starts.
+- **SLSQP is the cheapest solver where it works** (336 evaluations on
+  Rosenbrock, 3 453 on the rotated ellipsoid through SHGO), but from far starts
+  on the badly scaled ellipsoid it stops after its first line search, 11
+  evaluations in, and it is useless on plateaus and noise because its gradients
+  are finite differences.
+- **AUGLAG keeps the inner method's character, for better and worse.** Subplex
+  inside AUGLAG is perfect on the step function and reaches the rugged 4-D
+  basin through SHGO, but it still fails on the curved valley and the rotated
+  ellipsoid, the outer penalty iterations multiply evaluations (1 674 against
+  158 unconstrained on the step function), and constraints hold only to
+  `constraint_tol`: BOBYQA inside AUGLAG left a violation of 1.3e-2 on the
+  rotated ellipsoid.
+- **CMA-ES with mirrored linear constraints is the strongest general choice.**
+  It is the only method that reaches the constrained optimum of the rotated
+  ellipsoid from every start, and with four times the default population it
+  reaches the rugged bowl from 8 of 8 starts in 4-D and 7 of 8 in 10-D, the
+  noisy ellipsoid from every start, and the plateau function from every start,
+  with zero constraint violation. The price is again evaluations: 20 to 50
+  times COBYLA's on those problems.
+- **Mirroring, not projection.** Projecting samples onto the constraint was
+  tried first and converged to the best point on the boundary (f = 0.425 on the
+  rugged bowl) from every start, missing the interior constrained optimum
+  (f = 0.214) that lies 0.08 inside it: everything beyond the constraint maps
+  to the boundary, the mean drifts out, and the search degenerates to the
+  boundary hyperplane. Mirroring gives the same feasible points with no flat
+  region, and finds the interior optimum.
+- **The C API** does not expose linear constraints or `constraint_handling`
+  yet; closure constraints registered through `shgo_add_constraint` still
+  take the COBYLA path.
 
 ## SciPy Correspondence
 
