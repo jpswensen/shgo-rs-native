@@ -299,7 +299,8 @@ matching SciPy's re-triangulation semantics.
 | `LocalOptimizer::NelderMead` | `LN_NELDERMEAD` | Simplex method, no bounds. |
 | `LocalOptimizer::Praxis` | `LN_PRAXIS` | Principal axis method. |
 | `LocalOptimizer::NewuoaBound` | `LN_NEWUOA_BOUND` | NEWUOA with bound constraints. |
-| `LocalOptimizer::Sbplx` | `LN_SBPLX` | Subspace-searching simplex. |
+| `LocalOptimizer::Sbplx` | `LN_SBPLX` | Subplex: Nelder-Mead restarted on low-dimensional subspaces. Tolerates noise and non-smoothness, scales better than Nelder-Mead. |
+| `LocalOptimizer::Cmaes` | — (`cmaes` crate) | CMA-ES, population based. Bounds enforced by per-coordinate normalisation plus reflection; constraints upgrade to COBYLA. Seeded from the start point, so runs are deterministic. Tuned via `local_options.cmaes` (`CmaesOptions`: `sigma0`, `population_size`, `seed`, `parallel_eval`, `eval_final_mean`). See [Choosing between BOBYQA, Subplex and CMA-ES](#choosing-between-bobyqa-subplex-and-cma-es). |
 
 ## Termination Criteria
 
@@ -352,6 +353,147 @@ count. Measured on 16 cores:
 BOBYQA remains the default. Consider a gradient method when the candidate pool
 is narrower than the core count, which is the usual state of later iterations
 and of a small `maxiter_local`.
+
+### Choosing between BOBYQA, Subplex and CMA-ES
+
+`Sbplx` (Rowan's subplex, via NLopt) and `Cmaes` (the [`cmaes`](https://docs.rs/cmaes)
+crate) are the derivative-free alternatives for basins that are not smooth at
+the scale the local optimizer works on. `examples/local_optimizer_benchmark.rs`
+compares them with BOBYQA, L-BFGS and Nelder-Mead on landscapes that each break
+one assumption of the model-based methods:
+
+| problem | landscape | what it stresses |
+|---|---|---|
+| `rosen-6d` | Rosenbrock | smooth curved valley (control) |
+| `rotated-10d` | rotated ellipsoid, condition 1e6 | non-separable, ill-conditioned |
+| `rugged-4d/10d` | bowl + ripples of period 1/3 and amplitude 0.3 | ~8^dim local minima below the sampling resolution |
+| `noisy-6d` | ellipsoid + frozen white noise of amplitude 0.5 | noise 50x the objective at the target radius |
+| `step-5d` | ellipsoid quantised to plateaus of width 0.1 | zero gradient everywhere |
+
+Settings: `ftol_rel 1e-12`, `xtol_rel 1e-8`, `maxeval 1000·dim`, CMA-ES
+`sigma0 0.25` of the bound width. `Cmaes-4xpop` sets `population_size` to four
+times the crate default `4 + floor(3 ln dim)`, the standard remedy for
+multimodal or noisy objectives. "reached" counts starts that ended within the
+problem's tolerance of the optimum (1e-6 for the smooth problems, 1e-3 for the
+rugged bowl, distance 0.1 for the noisy one, exactly the zero plateau for the
+step function); the error is `f - f*`, or `|x - x*|` for the noisy problem.
+The two Rosenbrock misses are its second local minimum (`f ≈ 3.98`).
+
+**Local optimizer alone, 8 fixed starts per problem:**
+
+| problem | optimizer | reached | median err | worst err | median nfev | time ms |
+|---|---|---|---|---|---|---|
+| rosen-6d | Bobyqa | 6/8 | 3.4e-14 | 4.0e0 | 485 | 11.4 |
+| rosen-6d | Lbfgs | 7/8 | 5.7e-11 | 4.0e0 | 525 | 25.5 |
+| rosen-6d | NelderMead | 6/8 | 7.0e-15 | 4.0e0 | 960 | 1.3 |
+| rosen-6d | Sbplx | 0/8 | 5.3e-1 | 4.4e0 | 6000 | 3.7 |
+| rosen-6d | Cmaes | 7/8 | 6.1e-14 | 4.0e0 | 2770 | 22.4 |
+| rosen-6d | Cmaes-4xpop | 8/8 | 2.7e-14 | 2.6e-11 | 6014 | 38.5 |
+| rotated-10d | Bobyqa | 8/8 | 2.4e-12 | 6.0e-11 | 2972 | 187.8 |
+| rotated-10d | Lbfgs | 8/8 | 3.2e-7 | 3.2e-7 | 830 | 35.5 |
+| rotated-10d | NelderMead | 8/8 | 1.7e-14 | 2.7e-14 | 4933 | 17.1 |
+| rotated-10d | Sbplx | 0/8 | 5.7e1 | 1.8e2 | 10000 | 16.9 |
+| rotated-10d | Cmaes | 8/8 | 1.6e-13 | 3.2e-13 | 4757 | 64.4 |
+| rotated-10d | Cmaes-4xpop | 8/8 | 9.2e-14 | 7.4e-13 | 8162 | 87.4 |
+| rugged-4d | Bobyqa | 4/8 | 5.4e-2 | 3.2e-1 | 80 | 1.2 |
+| rugged-4d | Lbfgs | 0/8 | 1.1e0 | 2.5e0 | 120 | 8.8 |
+| rugged-4d | NelderMead | 1/8 | 2.1e-1 | 4.3e-1 | 329 | 0.5 |
+| rugged-4d | Sbplx | 3/8 | 1.1e-1 | 2.1e-1 | 372 | 0.4 |
+| rugged-4d | Cmaes | 3/8 | 1.1e-1 | 2.1e-1 | 962 | 7.2 |
+| rugged-4d | Cmaes-4xpop | 8/8 | 6.7e-14 | 1.9e-13 | 2290 | 15.1 |
+| rugged-10d | Bobyqa | 0/8 | 2.7e-1 | 6.4e-1 | 204 | 11.0 |
+| rugged-10d | Lbfgs | 0/8 | 1.8e0 | 3.8e0 | 363 | 14.8 |
+| rugged-10d | NelderMead | 0/8 | 1.4e0 | 3.4e0 | 1408 | 4.9 |
+| rugged-10d | Sbplx | 2/8 | 2.7e-1 | 6.4e-1 | 928 | 1.5 |
+| rugged-10d | Cmaes | 1/8 | 2.1e-1 | 4.3e-1 | 2467 | 33.3 |
+| rugged-10d | Cmaes-4xpop | 8/8 | 1.5e-13 | 3.2e-13 | 5762 | 60.2 |
+| noisy-6d | Bobyqa | 2/8 | 1.9e-1 | 4.6e-1 | 105 | 2.2 |
+| noisy-6d | Lbfgs | 0/8 | 5.5e0 | 7.1e0 | 84 | 6.2 |
+| noisy-6d | NelderMead | 0/8 | 7.3e-1 | 4.0e0 | 398 | 0.6 |
+| noisy-6d | Sbplx | 1/8 | 2.1e-1 | 3.5e-1 | 536 | 0.5 |
+| noisy-6d | Cmaes | 3/8 | 1.3e-1 | 3.5e-1 | 6005 | 60.1 |
+| noisy-6d | Cmaes-4xpop | 8/8 | 4.1e-2 | 7.3e-2 | 6014 | 53.3 |
+| step-5d | Bobyqa | 3/8 | 1.0e-2 | 1.6e-1 | 63 | 1.3 |
+| step-5d | Lbfgs | 0/8 | 1.1e3 | 1.7e3 | 6 | 1.0 |
+| step-5d | NelderMead | 3/8 | 3.8e-1 | 6.1e0 | 158 | 0.3 |
+| step-5d | Sbplx | 7/8 | 0.0e0 | 1.0e-1 | 158 | 0.2 |
+| step-5d | Cmaes | 8/8 | 0.0e0 | 0.0e0 | 666 | 7.0 |
+| step-5d | Cmaes-4xpop | 8/8 | 0.0e0 | 0.0e0 | 1282 | 10.2 |
+
+**Through SHGO** (Sobol + k-NN, `maxiter: 2`, `n` = 128 to 512): the minimizer
+pool hands every method several starts, one of them usually close to the
+optimum, so on four of the six problems every optimizer except Subplex on the
+two smooth ones reached the optimum. The two that still discriminate:
+
+| problem | optimizer | reached | err | nfev | nlfev | minima |
+|---|---|---|---|---|---|---|
+| rugged-10d | Bobyqa | yes | 5.4e-14 | 1187 | 162 | 1 |
+| rugged-10d | Lbfgs | no | 2.2e0 | 1234 | 209 | 1 |
+| rugged-10d | NelderMead | no | 5.4e-1 | 2087 | 1062 | 1 |
+| rugged-10d | Sbplx | no | 5.4e-1 | 1836 | 811 | 1 |
+| rugged-10d | Cmaes | no | 3.2e-1 | 3467 | 2442 | 1 |
+| rugged-10d | Cmaes-4xpop | yes | 3.5e-13 | 6587 | 5562 | 1 |
+| noisy-6d | Bobyqa | yes | 9.6e-2 | 1520 | 1003 | 9 |
+| noisy-6d | Lbfgs | no | 4.3e0 | 1668 | 1155 | 10 |
+| noisy-6d | NelderMead | no | 1.8e-1 | 4394 | 3877 | 9 |
+| noisy-6d | Sbplx | no | 1.6e-1 | 4326 | 3809 | 7 |
+| noisy-6d | Cmaes | yes | 2.4e-2 | 60567 | 60050 | 10 |
+| noisy-6d | Cmaes-4xpop | yes | 2.7e-2 | 60657 | 60140 | 10 |
+
+(On `rugged-10d` the single candidate happened to sit in the central basin,
+which is why BOBYQA reached it there but from none of the eight fixed starts;
+on `noisy-6d` BOBYQA's 0.096 is just inside the 0.1 tolerance where CMA-ES
+lands at 0.025.)
+
+What to take from it:
+
+- **Smooth basin: keep BOBYQA.** It is the most precise and, with L-BFGS, the
+  cheapest. CMA-ES needs 2 to 6 times the evaluations for the same answer on the
+  smooth problems and 12 times with the enlarged population; nothing is gained.
+- **Subplex is a plateau specialist, not a general fallback.** On the quantised
+  objective it is perfect from 7 of 8 starts at 158 evaluations, where BOBYQA's
+  quadratic model sees a flat function (3 of 8) and CMA-ES needs 4 times the
+  evaluations. But it searches coordinate subspaces, so it fails outright on the
+  curved Rosenbrock valley and the rotated ill-conditioned ellipsoid, both alone
+  and through SHGO.
+- **CMA-ES only pays off with an enlarged population.** With the default
+  population it is no better than BOBYQA on the rugged and noisy problems while
+  costing 10 to 50 times the evaluations. With `population_size` at four times
+  the default it is the only method that reaches the bottom of the rugged bowl
+  from every start in 4 and 10 dimensions, and the only one within the target
+  radius on the noisy ellipsoid from every start. That costs 20 to 30 times
+  BOBYQA's evaluations on those problems; it is worth it only when the basins
+  SHGO identifies are rugged or noisy below the sampling resolution, so BOBYQA
+  keeps returning a ripple minimum.
+- **Cap `maxeval` explicitly for CMA-ES.** The default of 1000 evaluations is
+  too small for CMA-ES with an enlarged population beyond about five dimensions
+  (use around `1000·dim`), and under noise the tolerance criteria never trigger,
+  so every candidate runs to the cap (the 60 000 evaluations on `noisy-6d`).
+- **`sigma0` is relative to the bounds the local run receives.** In simplicial
+  mode those are the locally convex bounds, so 0.25 is a quarter of the cell.
+  In Sobol mode they are the global bounds, so 0.25 is a global-scale search from
+  each candidate; lower it (0.1 in the calibration runs was as good or better on
+  the smooth problems) when the candidates are already good.
+- **Runs are deterministic.** Each CMA-ES run is seeded from its starting point,
+  so the parallel minimizer pool gives the same result as `workers: Some(1)`;
+  change `CmaesOptions::seed` to get a different realisation.
+
+```rust
+use shgo::{CmaesOptions, LocalOptimizer, LocalOptimizerOptions, Shgo, ShgoOptions};
+
+let options = ShgoOptions {
+    local_options: LocalOptimizerOptions {
+        algorithm: LocalOptimizer::Cmaes,
+        maxeval: Some(10_000),
+        cmaes: CmaesOptions {
+            population_size: Some(40), // 4x the default for 10 dimensions
+            ..Default::default()
+        },
+        ..Default::default()
+    },
+    ..Default::default()
+};
+```
 
 ## SciPy Correspondence
 

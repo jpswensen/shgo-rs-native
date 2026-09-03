@@ -86,7 +86,10 @@ typedef enum ShgoLocalOptimizer {
     /** NEWUOA with bounds */
     SHGO_LOCAL_NEWUOA_BOUND = 6,
     /** Subplex - Subspace-searching simplex */
-    SHGO_LOCAL_SBPLX = 7
+    SHGO_LOCAL_SBPLX = 7,
+    /** CMA-ES - Covariance Matrix Adaptation Evolution Strategy (bounds by
+     *  reflection; constrained problems are upgraded to COBYLA) */
+    SHGO_LOCAL_CMAES = 8
 } ShgoLocalOptimizer;
 
 /**

@@ -98,6 +98,9 @@ pub enum ShgoLocalOptimizer {
     NewuoaBound = 6,
     /// Subplex - Subspace-searching simplex
     Sbplx = 7,
+    /// CMA-ES - Covariance Matrix Adaptation Evolution Strategy (`cmaes` crate;
+    /// bounds by reflection, constraints upgrade to COBYLA)
+    Cmaes = 8,
 }
 
 impl From<ShgoLocalOptimizer> for LocalOptimizer {
@@ -111,6 +114,7 @@ impl From<ShgoLocalOptimizer> for LocalOptimizer {
             ShgoLocalOptimizer::Praxis => LocalOptimizer::Praxis,
             ShgoLocalOptimizer::NewuoaBound => LocalOptimizer::NewuoaBound,
             ShgoLocalOptimizer::Sbplx => LocalOptimizer::Sbplx,
+            ShgoLocalOptimizer::Cmaes => LocalOptimizer::Cmaes,
         }
     }
 }

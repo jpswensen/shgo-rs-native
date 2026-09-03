@@ -4298,6 +4298,59 @@ mod tests {
         println!("NelderMead: fun={}, x={:?}", result_nm.fun, result_nm.x);
     }
 
+    /// CMA-ES as the local optimizer runs through the same pool machinery and
+    /// converges on a smooth problem; with constraints it is upgraded to
+    /// COBYLA like every other bound-only algorithm.
+    #[test]
+    fn test_shgo_cmaes_local_optimizer() {
+        use crate::local_opt::{CmaesOptions, LocalOptimizer, LocalOptimizerOptions};
+
+        let bounds = vec![(-5.0, 5.0), (-5.0, 5.0)];
+        let local_options = LocalOptimizerOptions {
+            algorithm: LocalOptimizer::Cmaes,
+            cmaes: CmaesOptions { seed: 3, ..Default::default() },
+            ..LocalOptimizerOptions::default()
+        };
+        let options = ShgoOptions {
+            sampling_method: SamplingMethod::Sobol,
+            n: 64,
+            maxiter: Some(2),
+            local_options: local_options.clone(),
+            ..Default::default()
+        };
+        let result = Shgo::new(sphere, bounds.clone())
+            .with_options(options.clone())
+            .minimize()
+            .unwrap();
+        assert!(result.success);
+        assert!(result.fun < 1e-8, "fun = {}", result.fun);
+        assert!(result.x.iter().all(|v| v.abs() < 1e-3), "x = {:?}", result.x);
+        assert!(result.nlfev > 0);
+
+        // Same seed, same answer: the pool stays deterministic.
+        let again = Shgo::new(sphere, bounds.clone())
+            .with_options(options)
+            .minimize()
+            .unwrap();
+        assert_eq!(result.x, again.x);
+        assert_eq!(result.nlfev, again.nlfev);
+
+        // Constrained: x0 + x1 >= 1 -> optimum (0.5, 0.5), f = 0.5.
+        let constraint = |x: &[f64]| x[0] + x[1] - 1.0;
+        let result = Shgo::with_constraints(sphere, bounds, vec![constraint])
+            .with_options(ShgoOptions {
+                sampling_method: SamplingMethod::Sobol,
+                n: 64,
+                maxiter: Some(2),
+                local_options,
+                ..Default::default()
+            })
+            .minimize()
+            .unwrap();
+        assert!(result.x[0] + result.x[1] - 1.0 >= -1e-6, "x = {:?}", result.x);
+        assert!((result.fun - 0.5).abs() < 1e-4, "fun = {}", result.fun);
+    }
+
     #[test]
     fn test_shgo_sobol_with_local_minimization() {
         let bounds = vec![(-5.0, 5.0), (-5.0, 5.0)];

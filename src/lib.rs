@@ -53,7 +53,7 @@ pub use complex::Complex;
 pub use sobol::Sobol;
 pub use error::{ShgoError, Result as ShgoResult};
 pub use shgo::{BasinStats, Shgo, ShgoOptions, ShgoResult as OptimizeResult, SamplingMethod, ConnectivityMethod, KnnAuto, KnnSelection, RobustAggregate, Stencil, RobustnessProbe, RobustPolish, RobustnessStats, RobustMinimum, Bounds, LMapCache, LocalMinimum};
-pub use local_opt::{LocalOptimizer, LocalOptimizerOptions, LocalOptResult, minimize_local};
+pub use local_opt::{CmaesOptions, LocalOptimizer, LocalOptimizerOptions, LocalOptResult, minimize_local};
 
 /// Prelude module for convenient imports
 pub mod prelude {

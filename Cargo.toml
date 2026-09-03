@@ -31,6 +31,7 @@ ordered-float = "5.1.0"  # Orderable floats for sorting
 
 # Local optimization
 nlopt = "0.8"  # NLopt library for local optimization
+cmaes = { version = "0.2.2", default-features = false }  # CMA-ES backend (no plotters/FreeType)
 
 # Computational geometry
 qhull = "0.4"  # QHull bindings for Delaunay triangulation (Sobol mode)

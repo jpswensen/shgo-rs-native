@@ -67,7 +67,8 @@ enum class LocalOptimizer {
     NelderMead = SHGO_LOCAL_NELDER_MEAD,
     Praxis = SHGO_LOCAL_PRAXIS,
     NewuoaBound = SHGO_LOCAL_NEWUOA_BOUND,
-    Sbplx = SHGO_LOCAL_SBPLX
+    Sbplx = SHGO_LOCAL_SBPLX,
+    Cmaes = SHGO_LOCAL_CMAES
 };
 
 /**

@@ -27,6 +27,19 @@
 //! - **PRAXIS**: Principal Axis method.
 //!   Derivative-free, good for smooth functions.
 //!
+//! - **Sbplx**: Rowan's subplex method (NLopt `LN_SBPLX`).
+//!   Nelder-Mead restarted on low-dimensional subspaces; tolerates noise and
+//!   non-smoothness and scales to higher dimensions better than Nelder-Mead.
+//!
+//! - **CMA-ES**: Covariance Matrix Adaptation Evolution Strategy, provided by
+//!   the [`cmaes`](https://docs.rs/cmaes) crate rather than NLopt. Population
+//!   based and rank based, so it is robust to noise, plateaus, and small-scale
+//!   ruggedness that trap model-based methods, at the cost of more evaluations
+//!   on smooth problems. The crate has no bound support, so the search space
+//!   is mapped onto the box by normalising each coordinate by its bound width
+//!   and reflecting out-of-box points back inside (see [`CmaesOptions`]).
+//!   Every run is seeded from the starting point, so results are deterministic.
+//!
 //! # Example
 //!
 //! ```
@@ -48,6 +61,7 @@
 //! println!("Minimum at {:?} with value {}", result.x, result.fun);
 //! ```
 
+use cmaes::{CMAESOptions, DVector, TerminationReason};
 use nlopt::{Algorithm, Nlopt, Target};
 use rayon::prelude::*;
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -61,7 +75,9 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 /// - Use `Cobyla` when you have nonlinear inequality constraints
 /// - Use `Slsqp` when you need gradients and have constraints
 /// - Use `Lbfgs` for smooth unconstrained problems with gradients
-/// - Use `NelderMead` for noisy or non-smooth functions
+/// - Use `NelderMead` or `Sbplx` for noisy or non-smooth functions
+/// - Use `Cmaes` for rugged, noisy, or plateau-ridden basins where the
+///   quadratic-model methods stall (see [`CmaesOptions`])
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum LocalOptimizer {
     /// Bound Optimization BY Quadratic Approximation.
@@ -97,12 +113,19 @@ pub enum LocalOptimizer {
     /// Sbplx (subplex) method.
     /// Derivative-free variant of Nelder-Mead for higher dimensions.
     Sbplx,
+
+    /// CMA-ES (Covariance Matrix Adaptation Evolution Strategy) from the
+    /// `cmaes` crate. Derivative-free, population based; bounds are enforced
+    /// by reflection, constraints are not supported (SHGO upgrades to COBYLA).
+    /// Tuned via [`LocalOptimizerOptions::cmaes`].
+    Cmaes,
 }
 
 impl LocalOptimizer {
-    /// Convert to NLOPT Algorithm enum.
-    pub fn to_nlopt_algorithm(self) -> Algorithm {
-        match self {
+    /// Convert to the NLOPT Algorithm enum. Returns `None` for algorithms
+    /// that are not provided by NLopt (`Cmaes`).
+    pub fn to_nlopt_algorithm(self) -> Option<Algorithm> {
+        Some(match self {
             LocalOptimizer::Bobyqa => Algorithm::Bobyqa,
             LocalOptimizer::Cobyla => Algorithm::Cobyla,
             LocalOptimizer::Slsqp => Algorithm::Slsqp,
@@ -111,7 +134,14 @@ impl LocalOptimizer {
             LocalOptimizer::Praxis => Algorithm::Praxis,
             LocalOptimizer::NewuoaBound => Algorithm::NewuoaBound,
             LocalOptimizer::Sbplx => Algorithm::Sbplx,
-        }
+            LocalOptimizer::Cmaes => return None,
+        })
+    }
+
+    /// Whether the algorithm is implemented by NLopt (everything except
+    /// `Cmaes`).
+    pub fn is_nlopt(self) -> bool {
+        self.to_nlopt_algorithm().is_some()
     }
 
     /// Check if the algorithm supports nonlinear constraints.
@@ -122,6 +152,59 @@ impl LocalOptimizer {
     /// Check if the algorithm requires gradients (supplied by finite differences).
     pub fn requires_gradient(self) -> bool {
         matches!(self, LocalOptimizer::Slsqp | LocalOptimizer::Lbfgs)
+    }
+}
+
+/// Options specific to the CMA-ES backend (`LocalOptimizer::Cmaes`).
+///
+/// CMA-ES searches an unbounded space; this wrapper normalises every
+/// coordinate by its bound width (so one step size serves all coordinates)
+/// and reflects sampled points back into the box (a triangle-wave fold), so
+/// every objective evaluation is in bounds and a minimum on the boundary is
+/// reachable without the flat plateaus that clipping would create. The
+/// shared tolerances of [`LocalOptimizerOptions`] map as follows: `ftol_abs`
+/// bounds the function-value spread (`tol_fun`/`tol_fun_hist`), `xtol_rel`
+/// and `xtol_abs` bound the distribution's standard deviation in normalised
+/// units (`tol_x`), `maxeval` and `maxtime` cap the run. `initial_step` is an
+/// NLopt setting and is ignored here; use `sigma0` instead.
+#[derive(Debug, Clone)]
+pub struct CmaesOptions {
+    /// Initial step size (`sigma0`) as a fraction of each coordinate's bound
+    /// width (raw units for a coordinate without finite bounds). Larger values
+    /// step over more small-scale structure; smaller values converge faster on
+    /// smooth basins. Default: 0.25.
+    pub sigma0: f64,
+
+    /// Population size per generation (`lambda`). `None` uses the CMA-ES
+    /// default `4 + floor(3 ln(dim))`. Default: `None`.
+    pub population_size: Option<usize>,
+
+    /// Base RNG seed. The seed of each run is derived from this value and the
+    /// starting point, so a given start always reproduces the same result and
+    /// the parallel minimizer pool stays deterministic. Default: 0.
+    pub seed: u64,
+
+    /// Evaluate each generation's population in parallel on the rayon pool.
+    /// Useful when the objective is expensive and the candidate pool is
+    /// narrower than the core count; otherwise it only adds scheduling on top
+    /// of SHGO's per-candidate parallelism. Default: `false`.
+    pub parallel_eval: bool,
+
+    /// After termination also evaluate the final distribution mean (one extra
+    /// evaluation) and return it if it beats the best sampled point.
+    /// Default: `true`.
+    pub eval_final_mean: bool,
+}
+
+impl Default for CmaesOptions {
+    fn default() -> Self {
+        Self {
+            sigma0: 0.25,
+            population_size: None,
+            seed: 0,
+            parallel_eval: false,
+            eval_final_mean: true,
+        }
     }
 }
 
@@ -163,6 +246,9 @@ pub struct LocalOptimizerOptions {
 
     /// Verbosity: if true, print cost at each function evaluation during local optimization.
     pub disp: bool,
+
+    /// Settings used only when `algorithm == LocalOptimizer::Cmaes`.
+    pub cmaes: CmaesOptions,
 }
 
 impl Default for LocalOptimizerOptions {
@@ -178,6 +264,7 @@ impl Default for LocalOptimizerOptions {
             initial_step: None,
             constraint_tol: 1e-8,
             disp: false,
+            cmaes: CmaesOptions::default(),
         }
     }
 }
@@ -250,13 +337,14 @@ fn fd_gradient(
     x.len()
 }
 
-/// Run one NLOPT local minimization. Shared by the two public entry points.
+/// Run one local minimization. Shared by the two public entry points.
 ///
 /// `constraints` are inequality constraints in SHGO's `g(x) >= 0` convention;
 /// if any are present and `options.algorithm` cannot handle them the run is
 /// upgraded to COBYLA. Gradient-based algorithms receive forward-difference
-/// gradients of the objective and of every constraint.
-fn run_nlopt(
+/// gradients of the objective and of every constraint. `Cmaes` is dispatched
+/// to the `cmaes` crate; everything else runs through NLopt.
+fn run_local(
     func: ScalarFn<'_>,
     x0: &[f64],
     bounds: &[(f64, f64)],
@@ -283,6 +371,24 @@ fn run_nlopt(
     } else {
         options.algorithm
     };
+
+    match algo.to_nlopt_algorithm() {
+        Some(nlopt_algo) => run_nlopt(func, x0, bounds, constraints, options, algo, nlopt_algo),
+        None => run_cmaes(func, x0, bounds, options),
+    }
+}
+
+/// Run one NLOPT local minimization with the already-resolved algorithm.
+fn run_nlopt(
+    func: ScalarFn<'_>,
+    x0: &[f64],
+    bounds: &[(f64, f64)],
+    constraints: &[ScalarFn<'_>],
+    options: &LocalOptimizerOptions,
+    algo: LocalOptimizer,
+    nlopt_algo: Algorithm,
+) -> LocalOptResult {
+    let dim = x0.len();
     let needs_grad = algo.requires_gradient();
 
     // Track function evaluations (finite-difference evaluations included).
@@ -307,7 +413,7 @@ fn run_nlopt(
     };
 
     // Create NLOPT optimizer
-    let mut opt = Nlopt::new(algo.to_nlopt_algorithm(), dim, objective, Target::Minimize, ());
+    let mut opt = Nlopt::new(nlopt_algo, dim, objective, Target::Minimize, ());
 
     // Set bounds
     let lower_bounds: Vec<f64> = bounds.iter().map(|(l, _)| *l).collect();
@@ -447,7 +553,258 @@ fn run_nlopt(
     }
 }
 
-/// Perform local minimization using NLOPT.
+/// Fold a value into `[lo, hi]` by reflection (a triangle wave with period
+/// `2 (hi - lo)`), so the map is continuous, distance preserving inside the
+/// box, and reaches the bounds exactly. One-sided bounds reflect about the
+/// finite side; unbounded coordinates pass through.
+fn reflect_into(v: f64, lo: f64, hi: f64) -> f64 {
+    match (lo.is_finite(), hi.is_finite()) {
+        (true, true) if hi > lo => {
+            let w = hi - lo;
+            let t = (v - lo).rem_euclid(2.0 * w);
+            lo + if t <= w { t } else { 2.0 * w - t }
+        }
+        (true, true) => lo,
+        (true, false) => lo + (v - lo).abs(),
+        (false, true) => hi - (hi - v).abs(),
+        (false, false) => v,
+    }
+}
+
+/// Maps CMA-ES's unbounded, normalised search space onto the bound box:
+/// `x_i = reflect(lo_i + z_i * width_i)`, with `width_i = 1` for coordinates
+/// without two finite bounds.
+struct BoxMap {
+    lo: Vec<f64>,
+    hi: Vec<f64>,
+    scale: Vec<f64>,
+}
+
+impl BoxMap {
+    fn new(bounds: &[(f64, f64)]) -> Self {
+        let lo: Vec<f64> = bounds.iter().map(|b| b.0).collect();
+        let hi: Vec<f64> = bounds.iter().map(|b| b.1).collect();
+        let scale = bounds
+            .iter()
+            .map(|&(l, u)| {
+                if l.is_finite() && u.is_finite() && u > l {
+                    u - l
+                } else {
+                    1.0
+                }
+            })
+            .collect();
+        Self { lo, hi, scale }
+    }
+
+    fn origin(&self, i: usize) -> f64 {
+        if self.lo[i].is_finite() {
+            self.lo[i]
+        } else {
+            0.0
+        }
+    }
+
+    /// Box coordinates -> normalised search coordinates (identity up to
+    /// scaling; `x` is assumed to lie inside the box).
+    fn to_internal(&self, x: &[f64]) -> Vec<f64> {
+        x.iter()
+            .enumerate()
+            .map(|(i, &xi)| (xi - self.origin(i)) / self.scale[i])
+            .collect()
+    }
+
+    /// Normalised search coordinates -> a point inside the box.
+    fn to_box(&self, z: &[f64]) -> Vec<f64> {
+        z.iter()
+            .enumerate()
+            .map(|(i, &zi)| reflect_into(self.origin(i) + zi * self.scale[i], self.lo[i], self.hi[i]))
+            .collect()
+    }
+
+    /// Smallest normalisation factor (for converting absolute x tolerances).
+    fn min_scale(&self) -> f64 {
+        self.scale.iter().cloned().fold(f64::INFINITY, f64::min).max(f64::MIN_POSITIVE)
+    }
+}
+
+/// Deterministic per-run seed: mixes the base seed with the bits of the
+/// starting point (splitmix64 finaliser), so identical starts give identical
+/// CMA-ES runs regardless of thread scheduling.
+fn cmaes_seed(base: u64, x0: &[f64]) -> u64 {
+    fn mix(mut z: u64) -> u64 {
+        z = (z ^ (z >> 30)).wrapping_mul(0xbf58_476d_1ce4_e5b9);
+        z = (z ^ (z >> 27)).wrapping_mul(0x94d0_49bb_1331_11eb);
+        z ^ (z >> 31)
+    }
+    let mut h = mix(base ^ 0x9e37_79b9_7f4a_7c15);
+    for &xi in x0 {
+        h = mix(h ^ xi.to_bits().wrapping_add(0x9e37_79b9_7f4a_7c15));
+    }
+    h
+}
+
+/// Run one CMA-ES local minimization via the `cmaes` crate.
+///
+/// The starting point is evaluated first and kept as the incumbent, so the
+/// result is never worse than `x0` (matching the NLopt algorithms, which all
+/// evaluate `x0`). Termination on any of the crate's tolerance criteria or on
+/// the evaluation/time budget counts as success; numerical breakdowns
+/// (`InvalidFunctionValue`, `PosDefCov`, `TolXUp`) are reported as failures
+/// but still return the best point seen.
+fn run_cmaes(
+    func: ScalarFn<'_>,
+    x0: &[f64],
+    bounds: &[(f64, f64)],
+    options: &LocalOptimizerOptions,
+) -> LocalOptResult {
+    let dim = x0.len();
+    if dim == 0 {
+        return LocalOptResult::failure(x0, "CMA-ES needs at least one dimension".to_string());
+    }
+    let cfg = &options.cmaes;
+    if !(cfg.sigma0.is_finite() && cfg.sigma0 > 0.0) {
+        return LocalOptResult::failure(
+            x0,
+            format!("Invalid CMA-ES sigma0 {} (must be finite and > 0)", cfg.sigma0),
+        );
+    }
+
+    let map = BoxMap::new(bounds);
+    let disp = options.disp;
+    let fev_count = AtomicUsize::new(0);
+    // Evaluate through the box map; counts every evaluation.
+    let eval_box = |x: &[f64]| -> f64 {
+        let n = fev_count.fetch_add(1, Ordering::Relaxed) + 1;
+        let val = func(x);
+        if disp {
+            println!("  [Cmaes eval #{:>3}] f = {:+.6e}", n, val);
+        }
+        val
+    };
+
+    // Incumbent: the starting point itself.
+    let x0_in_box = map.to_box(&map.to_internal(x0));
+    let mut best_x = x0_in_box;
+    let mut best_f = eval_box(&best_x);
+
+    let reserved = 1 + usize::from(cfg.eval_final_mean);
+    let z0 = map.to_internal(&best_x);
+    let mean = DVector::from_vec(z0);
+    let tol_fun = options.ftol_abs.max(0.0);
+    let tol_x = options
+        .xtol_rel
+        .max(options.xtol_abs / map.min_scale())
+        .max(0.0);
+
+    let mut builder = CMAESOptions::new(mean, cfg.sigma0)
+        .seed(cmaes_seed(cfg.seed, x0))
+        .tol_fun(tol_fun)
+        .tol_fun_hist(tol_fun)
+        .tol_x(tol_x);
+    if let Some(lambda) = cfg.population_size {
+        builder = builder.population_size(lambda);
+    }
+    if let Some(maxeval) = options.maxeval {
+        builder = builder.max_function_evals((maxeval as usize).saturating_sub(reserved).max(1));
+    }
+    if let Some(maxtime) = options.maxtime {
+        if maxtime.is_finite() && maxtime > 0.0 {
+            builder = builder.max_time(std::time::Duration::from_secs_f64(maxtime));
+        }
+    }
+
+    let objective = |z: &DVector<f64>| -> f64 { eval_box(&map.to_box(z.as_slice())) };
+    let mut state = match builder.build(&objective) {
+        Ok(s) => s,
+        Err(e) => {
+            return LocalOptResult {
+                x: best_x,
+                fun: best_f,
+                success: false,
+                message: format!("Optimization failed: invalid CMA-ES options ({:?})", e),
+                nfev: fev_count.load(Ordering::Relaxed),
+                nit: 0,
+            }
+        }
+    };
+    let data = if cfg.parallel_eval {
+        state.run_parallel()
+    } else {
+        state.run()
+    };
+    let generations = state.generation();
+
+    // Best evaluated point, then optionally the final mean.
+    let better = |f: f64, incumbent: f64| f < incumbent || (incumbent.is_nan() && !f.is_nan());
+    if let Some(ind) = data.overall_best.as_ref() {
+        if better(ind.value, best_f) {
+            best_x = map.to_box(ind.point.as_slice());
+            best_f = ind.value;
+        }
+    }
+    if cfg.eval_final_mean {
+        let xm = map.to_box(data.final_mean.as_slice());
+        let fm = eval_box(&xm);
+        if better(fm, best_f) {
+            best_x = xm;
+            best_f = fm;
+        }
+    }
+    let final_fev = fev_count.load(Ordering::Relaxed);
+
+    let broke_down = data.reasons.iter().any(|r| {
+        matches!(
+            r,
+            TerminationReason::InvalidFunctionValue
+                | TerminationReason::PosDefCov
+                | TerminationReason::TolXUp
+        )
+    });
+    let reasons: Vec<String> = data.reasons.iter().map(|r| r.to_string()).collect();
+    let reasons = reasons.join(", ");
+    if disp {
+        println!(
+            "  [Cmaes] {}: f_best = {:+.6e} ({} evals, {} generations)",
+            reasons, best_f, final_fev, generations
+        );
+    }
+
+    if !best_f.is_finite() {
+        LocalOptResult {
+            x: best_x,
+            fun: best_f,
+            success: false,
+            message: format!(
+                "Optimization failed: objective is non-finite at the returned point ({})",
+                reasons
+            ),
+            nfev: final_fev,
+            nit: generations,
+        }
+    } else if broke_down {
+        LocalOptResult {
+            x: best_x,
+            fun: best_f,
+            success: false,
+            message: format!("Optimization failed: CMA-ES terminated on {}", reasons),
+            nfev: final_fev,
+            nit: generations,
+        }
+    } else {
+        LocalOptResult {
+            x: best_x,
+            fun: best_f,
+            success: true,
+            message: format!("Optimization succeeded: CMA-ES terminated on {}", reasons),
+            nfev: final_fev,
+            nit: generations,
+        }
+    }
+}
+
+/// Perform local minimization using NLOPT (or the `cmaes` crate for
+/// `LocalOptimizer::Cmaes`).
 ///
 /// # Arguments
 ///
@@ -485,7 +842,7 @@ where
     let cons: Vec<ScalarFn<'_>> = constraints
         .map(|cs| cs.iter().map(|g| g as ScalarFn<'_>).collect())
         .unwrap_or_default();
-    run_nlopt(func, x0, bounds, &cons, options)
+    run_local(func, x0, bounds, &cons, options)
 }
 
 /// Perform local minimization with constraints using NLOPT's constraint support.
@@ -515,7 +872,7 @@ where
     F: Fn(&[f64]) -> f64 + Sync,
 {
     let cons: Vec<ScalarFn<'_>> = constraints.iter().map(|b| &**b as ScalarFn<'_>).collect();
-    run_nlopt(&func, x0, bounds, &cons, options)
+    run_local(&func, x0, bounds, &cons, options)
 }
 
 #[cfg(test)]
@@ -547,16 +904,19 @@ mod tests {
     fn test_algorithm_conversion() {
         assert!(matches!(
             LocalOptimizer::Bobyqa.to_nlopt_algorithm(),
-            Algorithm::Bobyqa
+            Some(Algorithm::Bobyqa)
         ));
         assert!(matches!(
             LocalOptimizer::Cobyla.to_nlopt_algorithm(),
-            Algorithm::Cobyla
+            Some(Algorithm::Cobyla)
         ));
         assert!(matches!(
             LocalOptimizer::Slsqp.to_nlopt_algorithm(),
-            Algorithm::Slsqp
+            Some(Algorithm::Slsqp)
         ));
+        assert!(LocalOptimizer::Cmaes.to_nlopt_algorithm().is_none());
+        assert!(!LocalOptimizer::Cmaes.is_nlopt());
+        assert!(LocalOptimizer::Sbplx.is_nlopt());
     }
 
     #[test]
@@ -568,6 +928,8 @@ mod tests {
         assert!(LocalOptimizer::Slsqp.requires_gradient());
         assert!(LocalOptimizer::Lbfgs.requires_gradient());
         assert!(!LocalOptimizer::Bobyqa.requires_gradient());
+        assert!(!LocalOptimizer::Cmaes.supports_constraints());
+        assert!(!LocalOptimizer::Cmaes.requires_gradient());
     }
 
     #[test]
@@ -814,6 +1176,7 @@ mod tests {
             LocalOptimizer::Praxis,
             LocalOptimizer::NewuoaBound,
             LocalOptimizer::Sbplx,
+            LocalOptimizer::Cmaes,
         ];
 
         for alg in algorithms {
@@ -832,5 +1195,233 @@ mod tests {
             );
             assert_relative_eq!(result.fun, 0.0, epsilon = 1e-5);
         }
+    }
+    #[test]
+    fn test_reflect_into_box_properties() {
+        // Identity inside the box, bounds reachable exactly, fold-back outside.
+        assert_eq!(reflect_into(0.3, 0.0, 1.0), 0.3);
+        assert_eq!(reflect_into(0.0, 0.0, 1.0), 0.0);
+        assert_eq!(reflect_into(1.0, 0.0, 1.0), 1.0);
+        assert_relative_eq!(reflect_into(1.25, 0.0, 1.0), 0.75);
+        assert_relative_eq!(reflect_into(-0.25, 0.0, 1.0), 0.25);
+        assert_relative_eq!(reflect_into(2.25, 0.0, 1.0), 0.25); // period 2
+        assert_relative_eq!(reflect_into(-3.0, -5.0, 5.0), -3.0);
+        assert_relative_eq!(reflect_into(7.0, -5.0, 5.0), 3.0);
+        // One-sided and unbounded coordinates.
+        assert_relative_eq!(reflect_into(-2.0, 0.0, f64::INFINITY), 2.0);
+        assert_relative_eq!(reflect_into(3.0, f64::NEG_INFINITY, 1.0), -1.0);
+        assert_eq!(reflect_into(42.0, f64::NEG_INFINITY, f64::INFINITY), 42.0);
+        // Degenerate box collapses to the single feasible value.
+        assert_eq!(reflect_into(9.0, 2.0, 2.0), 2.0);
+        // Continuity across many periods: never leaves the box.
+        for i in -200..200 {
+            let v = i as f64 * 0.37;
+            let r = reflect_into(v, -1.5, 2.5);
+            assert!((-1.5..=2.5).contains(&r), "{} -> {}", v, r);
+        }
+    }
+
+    #[test]
+    fn test_box_map_round_trip() {
+        let bounds = [(-5.0, 5.0), (0.0, 1.0), (f64::NEG_INFINITY, f64::INFINITY)];
+        let map = BoxMap::new(&bounds);
+        let x = [2.5, 0.25, -7.0];
+        let z = map.to_internal(&x);
+        assert_relative_eq!(z[0], 0.75);
+        assert_relative_eq!(z[1], 0.25);
+        assert_relative_eq!(z[2], -7.0);
+        let back = map.to_box(&z);
+        for (a, b) in back.iter().zip(&x) {
+            assert_relative_eq!(a, b, epsilon = 1e-12);
+        }
+        assert_relative_eq!(map.min_scale(), 1.0);
+    }
+
+    #[test]
+    fn test_minimize_sphere_cmaes() {
+        let bounds = vec![(-5.0, 5.0), (-5.0, 5.0)];
+        let x0 = vec![1.0, 1.0];
+        let options = LocalOptimizerOptions {
+            algorithm: LocalOptimizer::Cmaes,
+            ..Default::default()
+        };
+        let result = minimize_local(&sphere, &x0, &bounds, None::<&[fn(&[f64]) -> f64]>, &options);
+        assert!(result.success, "{}", result.message);
+        assert!(result.message.contains("CMA-ES"));
+        assert!(result.nit > 0, "generations should be reported in nit");
+        assert_relative_eq!(result.fun, 0.0, epsilon = 1e-8);
+        assert_relative_eq!(result.x[0], 0.0, epsilon = 1e-4);
+        assert_relative_eq!(result.x[1], 0.0, epsilon = 1e-4);
+    }
+
+    /// The unconstrained minimum lies outside the box: the answer must sit on
+    /// the boundary and no probe may ever leave the bounds.
+    #[test]
+    fn test_cmaes_respects_bounds() {
+        let bounds = vec![(-5.0, 5.0), (-5.0, 5.0)];
+        let shifted = |x: &[f64]| {
+            for (i, xi) in x.iter().enumerate() {
+                assert!(
+                    *xi >= bounds[i].0 && *xi <= bounds[i].1,
+                    "CMA-ES evaluated an out-of-bounds point {:?}",
+                    x
+                );
+            }
+            (x[0] - 7.0).powi(2) + (x[1] - 7.0).powi(2)
+        };
+        let options = LocalOptimizerOptions {
+            algorithm: LocalOptimizer::Cmaes,
+            maxeval: Some(4000),
+            ..Default::default()
+        };
+        let result = minimize_local(&shifted, &[0.0, 0.0], &bounds, None::<&[fn(&[f64]) -> f64]>, &options);
+        assert!(result.success, "{}", result.message);
+        assert_relative_eq!(result.x[0], 5.0, epsilon = 1e-4);
+        assert_relative_eq!(result.x[1], 5.0, epsilon = 1e-4);
+        assert_relative_eq!(result.fun, 8.0, epsilon = 1e-3);
+    }
+
+    #[test]
+    fn test_cmaes_is_deterministic() {
+        let bounds = vec![(-5.0, 5.0); 3];
+        let x0 = vec![2.0, -1.0, 0.5];
+        let options = LocalOptimizerOptions {
+            algorithm: LocalOptimizer::Cmaes,
+            ..Default::default()
+        };
+        let a = minimize_local(&rosenbrock3, &x0, &bounds, None::<&[fn(&[f64]) -> f64]>, &options);
+        let b = minimize_local(&rosenbrock3, &x0, &bounds, None::<&[fn(&[f64]) -> f64]>, &options);
+        assert_eq!(a.x, b.x);
+        assert_eq!(a.fun.to_bits(), b.fun.to_bits());
+        assert_eq!(a.nfev, b.nfev);
+        // A different base seed gives a different (but still converged) run.
+        let options2 = LocalOptimizerOptions {
+            cmaes: CmaesOptions { seed: 7, ..Default::default() },
+            ..options.clone()
+        };
+        let c = minimize_local(&rosenbrock3, &x0, &bounds, None::<&[fn(&[f64]) -> f64]>, &options2);
+        assert!(c.success, "{}", c.message);
+        assert!(a.nfev != c.nfev || a.x != c.x, "seed had no effect");
+    }
+
+    fn rosenbrock3(x: &[f64]) -> f64 {
+        x.windows(2)
+            .map(|w| 100.0 * (w[1] - w[0] * w[0]).powi(2) + (1.0 - w[0]).powi(2))
+            .sum()
+    }
+
+    /// The start is evaluated and kept as the incumbent, so even a starved
+    /// budget returns something no worse than `x0`.
+    #[test]
+    fn test_cmaes_never_worse_than_start() {
+        let bounds = vec![(-5.0, 5.0); 4];
+        let x0 = vec![0.01, -0.02, 0.005, 0.0];
+        let f0 = sphere(&x0);
+        let options = LocalOptimizerOptions {
+            algorithm: LocalOptimizer::Cmaes,
+            maxeval: Some(3),
+            cmaes: CmaesOptions { sigma0: 0.4, ..Default::default() },
+            ..Default::default()
+        };
+        let result = minimize_local(&sphere, &x0, &bounds, None::<&[fn(&[f64]) -> f64]>, &options);
+        assert!(result.fun <= f0, "{} > f(x0) = {}", result.fun, f0);
+        assert!(result.nfev >= 1);
+        assert!(result.nfev <= 3 + 12, "budget overshoot: {}", result.nfev);
+    }
+
+    #[test]
+    fn test_cmaes_unbounded_coordinates() {
+        let bounds = vec![(f64::NEG_INFINITY, f64::INFINITY), (0.0, f64::INFINITY)];
+        let f = |x: &[f64]| {
+            assert!(x[1] >= 0.0, "left the one-sided bound: {:?}", x);
+            (x[0] - 1.5).powi(2) + (x[1] + 2.0).powi(2)
+        };
+        let options = LocalOptimizerOptions {
+            algorithm: LocalOptimizer::Cmaes,
+            ..Default::default()
+        };
+        let result = minimize_local(&f, &[0.0, 1.0], &bounds, None::<&[fn(&[f64]) -> f64]>, &options);
+        assert!(result.success, "{}", result.message);
+        assert_relative_eq!(result.x[0], 1.5, epsilon = 1e-4);
+        assert_relative_eq!(result.x[1], 0.0, epsilon = 1e-4);
+    }
+
+    #[test]
+    fn test_cmaes_rejects_bad_sigma() {
+        let options = LocalOptimizerOptions {
+            algorithm: LocalOptimizer::Cmaes,
+            cmaes: CmaesOptions { sigma0: 0.0, ..Default::default() },
+            ..Default::default()
+        };
+        let result = minimize_local(&sphere, &[1.0, 1.0], &[(-5.0, 5.0); 2], None::<&[fn(&[f64]) -> f64]>, &options);
+        assert!(!result.success);
+        assert!(result.message.contains("sigma0"));
+        assert_eq!(result.nfev, 0);
+    }
+
+    /// A bowl with small high-frequency ripples (see
+    /// `examples/local_optimizer_benchmark.rs`): the quadratic-model method
+    /// stops in the nearest ripple, the population method with an enlarged
+    /// population reaches the bottom. Pins the behaviour the CMA-ES backend
+    /// exists for; the seeds make it deterministic.
+    #[test]
+    fn test_cmaes_escapes_ripples_where_bobyqa_stalls() {
+        let c = [0.3, -0.4];
+        let rugged = |x: &[f64]| -> f64 {
+            x.iter()
+                .zip(&c)
+                .map(|(a, b)| {
+                    let d = a - b;
+                    d * d + 0.15 * (1.0 - (2.0 * std::f64::consts::PI * 3.0 * d).cos())
+                })
+                .sum()
+        };
+        let bounds = vec![(-5.0, 5.0); 2];
+        let starts = [[2.5, 2.5], [-3.0, 1.0], [1.0, -3.0], [4.0, -4.0]];
+
+        let bobyqa = LocalOptimizerOptions {
+            algorithm: LocalOptimizer::Bobyqa,
+            maxeval: Some(4000),
+            ..Default::default()
+        };
+        let cmaes = LocalOptimizerOptions {
+            algorithm: LocalOptimizer::Cmaes,
+            maxeval: Some(4000),
+            cmaes: CmaesOptions { population_size: Some(32), ..Default::default() },
+            ..Default::default()
+        };
+        let mut bobyqa_stalled = 0;
+        for x0 in &starts {
+            let b = minimize_local(&rugged, x0, &bounds, None::<&[fn(&[f64]) -> f64]>, &bobyqa);
+            if b.fun > 1e-3 {
+                bobyqa_stalled += 1;
+            }
+            let c = minimize_local(&rugged, x0, &bounds, None::<&[fn(&[f64]) -> f64]>, &cmaes);
+            assert!(c.success, "{}", c.message);
+            assert!(c.fun < 1e-6, "CMA-ES from {:?} ended at f = {} ({})", x0, c.fun, c.message);
+        }
+        assert!(
+            bobyqa_stalled >= 2,
+            "BOBYQA stalled from only {} of {} starts; the ripples are no longer a trap",
+            bobyqa_stalled,
+            starts.len()
+        );
+    }
+
+    /// With constraints CMA-ES is upgraded to COBYLA like the other
+    /// bound-only algorithms.
+    #[test]
+    fn test_cmaes_constrained_upgrades_to_cobyla() {
+        let bounds = vec![(0.0, 2.0), (0.0, 2.0)];
+        let constraints = [|x: &[f64]| x[0] + x[1] - 1.0];
+        let options = LocalOptimizerOptions {
+            algorithm: LocalOptimizer::Cmaes,
+            ..Default::default()
+        };
+        let result = minimize_local(&sphere, &[1.5, 1.5], &bounds, Some(&constraints[..]), &options);
+        assert!(result.success, "{}", result.message);
+        assert!(!result.message.contains("CMA-ES"));
+        assert!(result.x[0] + result.x[1] - 1.0 >= -1e-6);
+        assert_relative_eq!(result.fun, 0.5, epsilon = 1e-4);
     }
 }
